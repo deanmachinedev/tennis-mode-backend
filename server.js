@@ -9,7 +9,7 @@ const ATP_SCOREBOARD_URL =
 
 app.use(cors());
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.send("Tennis Mode backend running");
 });
 
@@ -27,22 +27,6 @@ function pickPlayerName(competitor, fallback) {
   );
 }
 
-function parsePlayersFromEventName(eventName) {
-  if (typeof eventName !== "string") {
-    return { playerA: null, playerB: null };
-  }
-
-  if (eventName.includes(" vs ")) {
-    const parts = eventName.split(" vs ").map((s) => s.trim());
-    return {
-      playerA: parts[0] || null,
-      playerB: parts[1] || null
-    };
-  }
-
-  return { playerA: null, playerB: null };
-}
-
 function buildScoreLine(a, b) {
   const setsA = Array.isArray(a?.linescores)
     ? a.linescores.map((s) => String(s?.value ?? "0"))
@@ -51,94 +35,66 @@ function buildScoreLine(a, b) {
     ? b.linescores.map((s) => String(s?.value ?? "0"))
     : [];
 
-  const currentA = a?.score != null ? String(a.score) : "0";
-  const currentB = b?.score != null ? String(b.score) : "0";
+  const currentA = a?.score != null ? String(a.score) : "";
+  const currentB = b?.score != null ? String(b.score) : "";
 
   const setSummary =
     setsA.length && setsB.length
       ? setsA.map((value, index) => `${value}-${setsB[index] ?? "0"}`).join(" ")
       : "";
 
-  return setSummary
-    ? `${setSummary} ${currentA}-${currentB}`.trim()
-    : `${currentA}-${currentB}`;
+  const currentSummary =
+    currentA !== "" || currentB !== "" ? `${currentA || "0"}-${currentB || "0"}` : "";
+
+  return [setSummary, currentSummary].filter(Boolean).join(" ").trim() || "0-0";
 }
 
-function pickStatus(event, competition) {
-  return (
-    competition?.status?.type?.shortDetail ||
-    competition?.status?.type?.description ||
-    event?.status?.type?.shortDetail ||
-    event?.status?.type?.description ||
-    "Scheduled"
-  );
-}
+function normalizeCompetition(event, competition) {
+  const competitors = Array.isArray(competition?.competitors)
+    ? competition.competitors
+    : [];
 
-function pickTournament(event, competition) {
-  return (
-    event?.name ||
-    competition?.name ||
-    event?.shortName ||
-    "ATP"
-  );
-}
-
-function isLikelyDoubles(playerA, playerB, competition) {
-  const a = String(playerA || "");
-  const b = String(playerB || "");
-
-  if (a.includes("/") || b.includes("/")) {
-    return true;
-  }
-
-  const compType = String(
-    competition?.type?.abbreviation ||
-    competition?.type?.description ||
-    ""
-  ).toLowerCase();
-
-  if (compType.includes("double")) {
-    return true;
-  }
-
-  return false;
-}
-
-function normalizeAtpEvent(event) {
-  const competition = event?.competitions?.[0];
-  const competitors = competition?.competitors || [];
   const a = competitors[0] || {};
   const b = competitors[1] || {};
 
-  let playerA = pickPlayerName(a, "Player A");
-  let playerB = pickPlayerName(b, "Player B");
+  const playerA = pickPlayerName(a, "Player A");
+  const playerB = pickPlayerName(b, "Player B");
 
-  const parsed = parsePlayersFromEventName(event?.shortName || event?.name);
+  const typeSlug = String(competition?.type?.slug || "").toLowerCase();
+  const typeText = String(competition?.type?.text || "").toLowerCase();
 
-  if (playerA === "Player A" && parsed.playerA) {
-    playerA = parsed.playerA;
-  }
+  const category =
+    typeSlug.includes("double") || typeText.includes("double")
+      ? "doubles"
+      : "singles";
 
-  if (playerB === "Player B" && parsed.playerB) {
-    playerB = parsed.playerB;
-  }
-
-  const normalized = {
-    id: event?.id || `${playerA}-${playerB}`,
-    tournament: pickTournament(event, competition),
+  return {
+    id: competition?.id || `${event?.id || "event"}-${playerA}-${playerB}`,
+    tournament:
+      event?.name ||
+      event?.shortName ||
+      competition?.name ||
+      "ATP",
     playerA,
     playerB,
     scoreLine: buildScoreLine(a, b),
-    status: pickStatus(event, competition)
-  };
-
-  return {
-    ...normalized,
-    category: isLikelyDoubles(playerA, playerB, competition) ? "doubles" : "singles"
+    status:
+      competition?.status?.type?.shortDetail ||
+      competition?.status?.type?.description ||
+      event?.status?.type?.shortDetail ||
+      event?.status?.type?.description ||
+      "Scheduled",
+    category,
+    round:
+      competition?.round?.displayName ||
+      "",
+    court:
+      competition?.venue?.court ||
+      ""
   };
 }
 
-app.get("/api/atp", async (req, res) => {
+app.get("/api/atp", async (_req, res) => {
   try {
     const upstream = await fetch(ATP_SCOREBOARD_URL);
 
@@ -150,19 +106,28 @@ app.get("/api/atp", async (req, res) => {
 
     const raw = await upstream.json();
     const events = Array.isArray(raw?.events) ? raw.events : [];
-    const normalized = events.map(normalizeAtpEvent);
 
-    const singles = normalized
+    const allMatches = events.flatMap((event) => {
+      const competitions = Array.isArray(event?.competitions)
+        ? event.competitions
+        : [];
+
+      return competitions.map((competition) =>
+        normalizeCompetition(event, competition)
+      );
+    });
+
+    const singles = allMatches
       .filter((m) => m.category === "singles")
       .map(({ category, ...rest }) => rest);
 
-    const doubles = normalized
+    const doubles = allMatches
       .filter((m) => m.category === "doubles")
       .map(({ category, ...rest }) => rest);
 
     return res.json({
       updatedAt: new Date().toISOString(),
-      count: normalized.length,
+      count: allMatches.length,
       singles,
       doubles
     });
@@ -173,7 +138,7 @@ app.get("/api/atp", async (req, res) => {
   }
 });
 
-app.get("/api/atp-debug", async (req, res) => {
+app.get("/api/atp-debug", async (_req, res) => {
   try {
     const upstream = await fetch(ATP_SCOREBOARD_URL);
 
@@ -185,9 +150,11 @@ app.get("/api/atp-debug", async (req, res) => {
 
     const raw = await upstream.json();
     const firstEvent = Array.isArray(raw?.events) ? raw.events[0] : null;
+    const firstCompetition = firstEvent?.competitions?.[0] || null;
 
     return res.json({
-      firstEvent
+      firstEventName: firstEvent?.name || null,
+      firstCompetition
     });
   } catch (error) {
     return res.status(500).json({
