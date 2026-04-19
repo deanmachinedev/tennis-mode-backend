@@ -35,21 +35,15 @@ function buildScoreLine(a, b) {
     ? b.linescores.map((s) => String(s?.value ?? "0"))
     : [];
 
-  const currentA = a?.score != null ? String(a.score) : "";
-  const currentB = b?.score != null ? String(b.score) : "";
-
   const setSummary =
     setsA.length && setsB.length
       ? setsA.map((value, index) => `${value}-${setsB[index] ?? "0"}`).join(" ")
       : "";
 
-  const currentSummary =
-    currentA !== "" || currentB !== "" ? `${currentA || "0"}-${currentB || "0"}` : "";
-
-  return [setSummary, currentSummary].filter(Boolean).join(" ").trim() || "0-0";
+  return setSummary || "0-0";
 }
 
-function normalizeCompetition(event, competition) {
+function normalizeCompetition(event, grouping, competition) {
   const competitors = Array.isArray(competition?.competitors)
     ? competition.competitors
     : [];
@@ -60,8 +54,17 @@ function normalizeCompetition(event, competition) {
   const playerA = pickPlayerName(a, "Player A");
   const playerB = pickPlayerName(b, "Player B");
 
-  const typeSlug = String(competition?.type?.slug || "").toLowerCase();
-  const typeText = String(competition?.type?.text || "").toLowerCase();
+  const typeSlug = String(
+    competition?.type?.slug ||
+    grouping?.grouping?.slug ||
+    ""
+  ).toLowerCase();
+
+  const typeText = String(
+    competition?.type?.text ||
+    grouping?.grouping?.displayName ||
+    ""
+  ).toLowerCase();
 
   const category =
     typeSlug.includes("double") || typeText.includes("double")
@@ -73,7 +76,6 @@ function normalizeCompetition(event, competition) {
     tournament:
       event?.name ||
       event?.shortName ||
-      competition?.name ||
       "ATP",
     playerA,
     playerB,
@@ -85,12 +87,8 @@ function normalizeCompetition(event, competition) {
       event?.status?.type?.description ||
       "Scheduled",
     category,
-    round:
-      competition?.round?.displayName ||
-      "",
-    court:
-      competition?.venue?.court ||
-      ""
+    round: competition?.round?.displayName || "",
+    court: competition?.venue?.court || ""
   };
 }
 
@@ -108,13 +106,17 @@ app.get("/api/atp", async (_req, res) => {
     const events = Array.isArray(raw?.events) ? raw.events : [];
 
     const allMatches = events.flatMap((event) => {
-      const competitions = Array.isArray(event?.competitions)
-        ? event.competitions
-        : [];
+      const groupings = Array.isArray(event?.groupings) ? event.groupings : [];
 
-      return competitions.map((competition) =>
-        normalizeCompetition(event, competition)
-      );
+      return groupings.flatMap((grouping) => {
+        const competitions = Array.isArray(grouping?.competitions)
+          ? grouping.competitions
+          : [];
+
+        return competitions.map((competition) =>
+          normalizeCompetition(event, grouping, competition)
+        );
+      });
     });
 
     const singles = allMatches
@@ -150,10 +152,12 @@ app.get("/api/atp-debug", async (_req, res) => {
 
     const raw = await upstream.json();
     const firstEvent = Array.isArray(raw?.events) ? raw.events[0] : null;
-    const firstCompetition = firstEvent?.competitions?.[0] || null;
+    const firstGrouping = firstEvent?.groupings?.[0] || null;
+    const firstCompetition = firstGrouping?.competitions?.[0] || null;
 
     return res.json({
       firstEventName: firstEvent?.name || null,
+      firstGroupingName: firstGrouping?.grouping?.displayName || null,
       firstCompetition
     });
   } catch (error) {
