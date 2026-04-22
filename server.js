@@ -76,7 +76,13 @@ function normalizeStatus(statusObj) {
   }
 
   // Fallback: try to infer from description string alone
-  if (desc.includes("in progress") || detail.includes("set") || detail.includes("tiebreak")) return "live";
+  // Covers edge cases where ESPN omits the state field entirely
+  if (desc.includes("in progress") || desc.includes("playing")) return "live";
+  // Set ordinals: ESPN shortDetail "2nd" means "2nd Set" — state field should be "in"
+  // but if state is missing, catch ordinal patterns like "1st","2nd","3rd","4th","5th"
+  // and "tiebreak" as live indicators
+  if (/^\d+(st|nd|rd|th)$/.test(detail.trim())) return "live";
+  if (detail.includes("set") || detail.includes("tiebreak")) return "live";
   if (desc.includes("scheduled") || desc.includes("tbd")) return "scheduled";
   if (desc.includes("final")) return "final";
   if (desc.includes("retired")) return "retired";
@@ -103,25 +109,34 @@ function classifyDiscipline(grouping, competition) {
 // ESPN provides notes arrays and situation.lastPlay for live commentary
 function extractNotes(competition) {
   const notes = [];
+  const state = (competition?.status?.type?.state || "").toLowerCase();
+  const isLive = state === "in";
 
-  // competition.notes array
+  // competition.notes array — always include
   const noteArr = Array.isArray(competition?.notes) ? competition.notes : [];
   for (const n of noteArr) {
     const text = n?.text || n?.headline || "";
     if (text) notes.push(text);
   }
 
-  // situation.lastPlay.text — live commentary
-  const lastPlay = competition?.situation?.lastPlay?.text || "";
-  if (lastPlay && !notes.includes(lastPlay)) notes.push(lastPlay);
-
-  // status type detail as a note (e.g. "2nd Set, 6-4, 3-2")
-  const detail = competition?.status?.type?.detail || "";
-  if (detail && detail.toLowerCase() !== "scheduled" && detail.toLowerCase() !== "final") {
-    if (!notes.some((n) => n.includes(detail))) notes.push(detail);
+  // situation.lastPlay.text — live commentary, live matches only
+  if (isLive) {
+    const lastPlay = competition?.situation?.lastPlay?.text || "";
+    if (lastPlay && !notes.includes(lastPlay)) notes.push(lastPlay);
   }
 
-  return notes.slice(0, 3); // cap at 3 notes
+  // status type detail as a note ONLY for live matches.
+  // For scheduled matches, detail is the start date/time, which is already
+  // present as scheduledAt and would produce a duplicate line if added here.
+  // For final/retired matches, detail just repeats "Final"/"Retired".
+  if (isLive) {
+    const detail = competition?.status?.type?.detail || "";
+    if (detail && detail.toLowerCase() !== "scheduled" && detail.toLowerCase() !== "final") {
+      if (!notes.some((n) => n.includes(detail))) notes.push(detail);
+    }
+  }
+
+  return notes.slice(0, 2); // cap at 2 notes for display
 }
 
 // ─── COMPETITOR DETAIL ────────────────────────────────────────────────────────
