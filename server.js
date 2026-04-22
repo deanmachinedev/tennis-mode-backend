@@ -49,25 +49,41 @@ function buildScoreLine(a, b) {
 }
 
 // ─── STATUS NORMALIZATION ─────────────────────────────────────────────────────
-// Uses ESPN status.type.state as the authoritative signal:
-//   "in"   → live
-//   "pre"  → scheduled
-//   "post" → look at description/completed for final vs retired vs postponed
+// Priority order (most authoritative first):
+//   1. completed:true  — ESPN boolean, always means the match is over
+//   2. state:"post"    — authoritative completion signal
+//   3. state:"in"      — in progress, but check for suspension/delay FIRST
+//   4. state:"pre"     — scheduled/upcoming
+//   5. fallback string matching — for when state field is missing/empty
 //
-// Returns one of: "live" | "scheduled" | "final" | "retired" | "walkover"
-//                 "postponed" | "suspended" | "cancelled" | "unknown"
+// Returns one of: "live" | "suspended" | "scheduled" | "final" | "retired"
+//                 "walkover" | "postponed" | "cancelled" | "unknown"
 function normalizeStatus(statusObj) {
   const type = statusObj?.type || {};
   const state = (type.state || "").toLowerCase();
   const desc  = (type.description || "").toLowerCase();
   const detail = (type.detail || type.shortDetail || "").toLowerCase();
-  const completed = type.completed === true;
+  const name   = (type.name || "").toLowerCase();
+  // completed is a JSON boolean — use loose check to catch "true" string edge cases
+  // eslint-disable-next-line eqeqeq
+  const completed = type.completed === true || type.completed == "true";
 
-  if (state === "in") return "live";
-  if (state === "pre") return "scheduled";
+  // ── 1. completed:true always wins — even if state:"in" is stale ──────────────
+  // This is the tiebreak-match fix: ESPN sometimes serves state:"in" for a match
+  // that completed during a tiebreak because the scoreboard data is stale.
+  // completed:true is set server-side and is more reliable than state.
+  if (completed) {
+    if (desc.includes("retired")  || detail.includes("retired"))  return "retired";
+    if (desc.includes("walkover") || detail.includes("walkover") || desc.includes("w/o")) return "walkover";
+    if (desc.includes("postponed") || detail.includes("postponed")) return "postponed";
+    if (desc.includes("cancelled") || detail.includes("cancelled")) return "cancelled";
+    // Any completed match not matching the above is "final" — including tiebreaks
+    return "final";
+  }
 
-  if (state === "post" || completed) {
-    if (desc.includes("retired") || detail.includes("retired")) return "retired";
+  // ── 2. state:"post" — match is over ──────────────────────────────────────────
+  if (state === "post") {
+    if (desc.includes("retired")  || detail.includes("retired"))  return "retired";
     if (desc.includes("walkover") || detail.includes("walkover") || desc.includes("w/o")) return "walkover";
     if (desc.includes("postponed") || detail.includes("postponed")) return "postponed";
     if (desc.includes("cancelled") || detail.includes("cancelled")) return "cancelled";
@@ -75,19 +91,33 @@ function normalizeStatus(statusObj) {
     return "final";
   }
 
-  // Fallback: try to infer from description string alone
-  // Covers edge cases where ESPN omits the state field entirely
+  // ── 3. state:"in" — match is active, but may be suspended ───────────────────
+  // Suspended matches have state:"in" (still counted as in-progress by ESPN)
+  // but description/name/shortDetail contains suspension indicators.
+  if (state === "in") {
+    if (
+      desc.includes("suspend") || detail.includes("suspend") || name.includes("suspend") ||
+      desc.includes("rain delay") || detail.includes("rain delay") || name.includes("rain") ||
+      desc.includes("delay") || name.includes("delay")
+    ) return "suspended";
+    return "live";
+  }
+
+  // ── 4. state:"pre" — upcoming ────────────────────────────────────────────────
+  if (state === "pre") return "scheduled";
+
+  // ── 5. Fallback: state field is missing or empty — infer from strings ─────────
+  // This covers ESPN edge cases where state is not populated.
+  // Check completion signals first to avoid the tiebreak false-positive:
+  if (desc.includes("final") && !desc.includes("semifinal") && !desc.includes("quarterfinal")) return "final";
+  if (desc.includes("retired")) return "retired";
+  if (desc.includes("postponed") || detail.includes("postponed")) return "postponed";
+  if (desc.includes("suspended") || detail.includes("suspended") || name.includes("suspend")) return "suspended";
   if (desc.includes("in progress") || desc.includes("playing")) return "live";
-  // Set ordinals: ESPN shortDetail "2nd" means "2nd Set" — state field should be "in"
-  // but if state is missing, catch ordinal patterns like "1st","2nd","3rd","4th","5th"
-  // and "tiebreak" as live indicators
+  // Ordinal set indicators (e.g. shortDetail:"2nd") — only when not completed
   if (/^\d+(st|nd|rd|th)$/.test(detail.trim())) return "live";
   if (detail.includes("set") || detail.includes("tiebreak")) return "live";
   if (desc.includes("scheduled") || desc.includes("tbd")) return "scheduled";
-  if (desc.includes("final")) return "final";
-  if (desc.includes("retired")) return "retired";
-  if (desc.includes("postponed")) return "postponed";
-  if (desc.includes("suspended")) return "suspended";
   return "unknown";
 }
 
