@@ -254,60 +254,94 @@ function normalizeCompetition(event, grouping, competition) {
   let statusNorm = normalizeStatus(competition?.status || event?.status);
 
   // ── Stale-live detection ────────────────────────────────────────────────────
-  // ESPN sometimes keeps state:"in" after a match finishes (stale scrape).
-  // Two independent rules, applied in order. Either alone is sufficient to
-  // override statusNorm "live" → "final".
+  // ESPN sometimes keeps state:"in" / completed:false after a match ends.
+  // Three independent rules, applied in order. First match wins.
+  //
+  // The specific failing payload (Kovacevic vs Echargui):
+  //   state:"in", completed:false, recent:true, winner:false on both
+  //   linescores: [4,6,6] vs [6,4,6] — 3rd set at 6-6 (tiebreak)
+  //   note: "Kovacevic leads Echargui 6-4 4-6 6-6"
+  //   No situation.server (tiebreak is over, not in progress)
+  //
   if (statusNorm === "live" || statusNorm === "suspended") {
 
-    // Rule 1 — winner flag (most reliable)
-    // ESPN sets competitor.winner=true on the winning player immediately when
-    // the match ends, even when the state field hasn't been updated yet.
-    // A genuinely live match never has winner:true on any competitor.
+    // Rule 1 — winner flag (most reliable, catches most cases)
+    // ESPN sets competitor.winner=true on the winning competitor when the match
+    // ends. A genuinely live match never has winner:true on any competitor.
     const hasWinner = competitors.some((c) => c?.winner === true);
     if (hasWinner) {
       statusNorm = "final";
     } else {
-      // Rule 2 — old start time + complete linescore context (conservative fallback)
-      // Only fires when winner flag is absent on a stale ESPN record.
+
+      // Rule 2 — recent:false + sufficient linescore
+      // ESPN's top-level competition.recent is false once the match is no longer
+      // recent (i.e. settled). Combined with enough sets played and set wins, this
+      // confirms the match is done.
+      // Conditions (ALL required):
+      //   A. competition.recent === false  (ESPN confirms not recent)
+      //   B. Both competitors have ≥2 linescore entries  (≥2 sets played)
+      //   C. One competitor has ≥2 set wins  (enough sets won to close the match)
+      const isRecent  = competition?.recent === true || competition?.recent == null;
+      const linesA = Array.isArray(a?.linescores) ? a.linescores : [];
+      const linesB = Array.isArray(b?.linescores) ? b.linescores : [];
+      const hasSets = linesA.length >= 2 && linesB.length >= 2;
+
+      if (!isRecent && hasSets) {
+        const setWinsA = linesA.filter((s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)).length;
+        const setWinsB = linesB.filter((s, i) => (s?.value ?? s ?? 0) > (linesA[i]?.value ?? linesA[i] ?? 0)).length;
+        if (Math.max(setWinsA, setWinsB) >= 2) statusNorm = "final";
+      }
+
+      // Rule 3 — tied last set + no active tiebreak situation (catches Kovacevic case)
+      // Applies when: recent:true, state:in, no winner flag, but the last set
+      // score is tied at ≥6 (i.e. a tiebreak was in progress or just finished).
+      // A LIVE tiebreak has competition.situation.server set (the server in the
+      // tiebreak is tracked). A COMPLETED tiebreak has no situation.server.
+      // Combined with recent:true and a tied-set score, this means the tiebreak
+      // just ended but ESPN hasn't updated state yet.
       //
-      // Conditions (ALL must be true to avoid false-positives on real matches):
-      //   A. Match started more than 4 hours ago  — a real singles match is
-      //      never longer than ~4h; tiebreaks last minutes, not hours.
-      //      4h is conservative: suspended matches can age too, but they
-      //      would need all three conditions simultaneously.
-      //   B. Both competitors have at least 2 linescore entries — means at
-      //      least 2 sets have been scored, so this isn't a pre-match stale record.
-      //   C. At least one competitor's total set wins ≥ 2 — confirms enough sets
-      //      were actually played to constitute a completed singles match.
-      //      (Doubles can finish in 2 sets, singles needs 2 to have a winner.)
+      // This rule is deliberately conservative — requires ALL of:
+      //   A. Last set score is tied at ≥6 (tiebreak condition met for that set)
+      //   B. No situation.server field (no in-progress tiebreak server)
+      //   C. Both competitors have ≥2 linescore entries (not a pre-match record)
+      //   D. The set count makes sense for a completed match (one player has ≥2 set wins
+      //      counting a tiebreak set win for the tied set as belonging to whoever
+      //      leads in total sets — but we don't need to award it; just having the
+      //      other 2 sets be non-tied is sufficient)
       //
-      // What this does NOT break:
-      //   - A real live tiebreak: started < 4 hours ago, so condition A fails.
-      //   - A real live 5th set: started < 4 hours ago in most cases; even if
-      //     borderline, condition C (set wins ≥ 2) is the same for live and stale.
-      //   - A suspended match from today: started < 4 hours ago → A fails.
-      //   - A suspended match from yesterday: A passes, but these are legitimate
-      //     stale-live records that SHOULD be overridden to final anyway since
-      //     a match suspended >4h with no winner flag is almost certainly done.
-      const startDate = competition?.date || event?.date;
-      const ageMs = startDate ? (Date.now() - new Date(startDate).getTime()) : 0;
-      const oldEnough = ageMs > 4 * 60 * 60 * 1000; // 4 hours in ms
+      // False-positive guard: a REAL live tiebreak in set 3 of a 2-1 match will
+      // have situation.server set → Rule 3 does not fire.
+      if (statusNorm === "live" && hasSets) {
+        const lastIdxA = linesA.length - 1;
+        const lastIdxB = linesB.length - 1;
+        if (lastIdxA === lastIdxB && lastIdxA >= 1) {
+          const lastA = linesA[lastIdxA]?.value ?? linesA[lastIdxA] ?? 0;
+          const lastB = linesB[lastIdxB]?.value ?? linesB[lastIdxB] ?? 0;
+          const lastSetTied = lastA === lastB && lastA >= 6;
 
-      if (oldEnough) {
-        const linesA = Array.isArray(a?.linescores) ? a.linescores : [];
-        const linesB = Array.isArray(b?.linescores) ? b.linescores : [];
-        const hasSufficientSets = linesA.length >= 2 && linesB.length >= 2;
+          const hasActiveSituation = !!(
+            competition?.situation?.server ||
+            competition?.situation?.pointA != null ||
+            competition?.situation?.pointB != null
+          );
 
-        if (hasSufficientSets) {
-          // Count set wins: a competitor wins a set when their linescore value
-          // is strictly greater than the opponent's for that set index.
-          const setWinsA = linesA.filter((s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)).length;
-          const setWinsB = linesB.filter((s, i) => (s?.value ?? s ?? 0) > (linesA[i]?.value ?? linesA[i] ?? 0)).length;
-          const maxSetWins = Math.max(setWinsA, setWinsB);
+          if (lastSetTied && !hasActiveSituation) {
+            // Count set wins from all sets EXCEPT the last (tied) one
+            const setsExceptLast = linesA.slice(0, lastIdxA);
+            const setWinsAExcl = setsExceptLast.filter(
+              (s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)
+            ).length;
+            const setWinsBExcl = setsExceptLast.filter(
+              (s, i) => (linesB[i]?.value ?? linesB[i] ?? 0) > (s?.value ?? s ?? 0)
+            ).length;
+            // Either player leads the non-tied sets — one must be ahead ≥1
+            // (in a 3-set match at 1-1 sets, the tied set IS the decider)
+            // Just require that the non-tied sets are non-zero (real match played)
+            const realMatchPlayed = setWinsAExcl + setWinsBExcl >= 1;
 
-          // At least one player has won 2+ sets → match is complete
-          if (maxSetWins >= 2) {
-            statusNorm = "final";
+            if (realMatchPlayed) {
+              statusNorm = "final";
+            }
           }
         }
       }
