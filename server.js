@@ -121,18 +121,64 @@ function normalizeStatus(statusObj) {
   return "unknown";
 }
 
-// ─── DISCIPLINE CLASSIFICATION ────────────────────────────────────────────────
-// Uses grouping slug and competition type slug — more reliable than text matching
-function classifyDiscipline(grouping, competition) {
-  const sources = [
+// ─── DISCIPLINE + TOUR CLASSIFICATION ────────────────────────────────────────
+// Derive tour AND discipline from competition/grouping metadata.
+// NOT from which endpoint the match came from — the WTA endpoint can contain
+// men's matches and vice versa.
+//
+// Priority order:
+//   1. Exact slug match  (competition.type.slug, grouping.grouping.slug)
+//   2. Exact text match  (competition.type.text, grouping.grouping.displayName)
+//   3. Loose substring fallback  (only when explicit fields are absent/unrecognised)
+//
+// Returns: "atpSingles" | "atpDoubles" | "wtaSingles" | "wtaDoubles" | null
+// null = cannot classify safely → caller skips the competition entirely.
+function classifyCompetition(grouping, competition) {
+  // ── Step 1: exact slug mapping ───────────────────────────────────────────────
+  // ESPN slugs are machine-generated identifiers — most reliable signal.
+  const slugs = [
     competition?.type?.slug,
     grouping?.grouping?.slug,
+    competition?.type?.abbreviation,
+  ].map((s) => String(s || "").toLowerCase().trim());
+
+  for (const slug of slugs) {
+    if (slug === "mens-singles"   || slug === "ms") return "atpSingles";
+    if (slug === "mens-doubles"   || slug === "md") return "atpDoubles";
+    if (slug === "womens-singles" || slug === "ws") return "wtaSingles";
+    if (slug === "womens-doubles" || slug === "wd") return "wtaDoubles";
+    if (slug === "mixed-doubles"  || slug === "mx") return null; // skip mixed
+  }
+
+  // ── Step 2: exact display-text mapping ───────────────────────────────────────
+  // ESPN displayName / type.text values are human-readable but well-known strings.
+  const texts = [
     competition?.type?.text,
     grouping?.grouping?.displayName,
-    competition?.type?.abbreviation,
-  ].map((s) => String(s || "").toLowerCase());
+  ].map((s) => String(s || "").toLowerCase().trim());
 
-  return sources.some((s) => s.includes("double")) ? "doubles" : "singles";
+  for (const text of texts) {
+    if (text === "men's singles"   || text === "mens singles")   return "atpSingles";
+    if (text === "men's doubles"   || text === "mens doubles")   return "atpDoubles";
+    if (text === "women's singles" || text === "womens singles") return "wtaSingles";
+    if (text === "women's doubles" || text === "womens doubles") return "wtaDoubles";
+    if (text === "mixed doubles")                                return null;
+  }
+
+  // ── Step 3: loose substring fallback ─────────────────────────────────────────
+  // Only reached when ESPN provides non-standard slug/text values.
+  // Gender check: "men" must be present WITHOUT "women" as a prefix/substring
+  // (i.e. "womens-singles" contains "men" but also "women" → isWomens wins).
+  const allSources = [...slugs, ...texts];
+  const isMens   = allSources.some((s) => s.includes("men") && !s.includes("women"));
+  const isWomens = allSources.some((s) => s.includes("women") || s.includes("wta"));
+  const isDoubles = allSources.some((s) => s.includes("double"));
+
+  if (isWomens && !isMens) return isDoubles ? "wtaDoubles"  : "wtaSingles";
+  if (isMens  && !isWomens) return isDoubles ? "atpDoubles" : "atpSingles";
+
+  // Ambiguous or no gender signal — skip rather than contaminate a bucket.
+  return null;
 }
 
 // ─── MATCH NOTES ─────────────────────────────────────────────────────────────
@@ -189,32 +235,98 @@ function extractCompetitorDetail(competitor) {
 }
 
 // ─── CORE TRANSFORM ──────────────────────────────────────────────────────────
-function normalizeCompetition(event, grouping, competition, tour) {
+function normalizeCompetition(event, grouping, competition) {
   const competitors = Array.isArray(competition?.competitors) ? competition.competitors : [];
   const a = competitors[0] || {};
   const b = competitors[1] || {};
 
   const compA = extractCompetitorDetail(a);
   const compB = extractCompetitorDetail(b);
-  const discipline = classifyDiscipline(grouping, competition);
-  const statusNorm = normalizeStatus(competition?.status || event?.status);
 
-  // Scheduled date — use competition date first, then event date
+  // Classify tour + discipline from competition metadata (not endpoint URL).
+  // Returns "atpSingles" | "atpDoubles" | "wtaSingles" | "wtaDoubles" | null.
+  const bucket = classifyCompetition(grouping, competition);
+  if (!bucket) return null;  // unclassifiable — caller skips this competition
+
+  const tour       = bucket.startsWith("atp") ? "ATP" : "WTA";
+  const discipline = bucket.endsWith("Singles") ? "singles" : "doubles";
+
+  let statusNorm = normalizeStatus(competition?.status || event?.status);
+
+  // ── Stale-live detection ────────────────────────────────────────────────────
+  // ESPN sometimes keeps state:"in" after a match finishes (stale scrape).
+  // Two independent rules, applied in order. Either alone is sufficient to
+  // override statusNorm "live" → "final".
+  if (statusNorm === "live" || statusNorm === "suspended") {
+
+    // Rule 1 — winner flag (most reliable)
+    // ESPN sets competitor.winner=true on the winning player immediately when
+    // the match ends, even when the state field hasn't been updated yet.
+    // A genuinely live match never has winner:true on any competitor.
+    const hasWinner = competitors.some((c) => c?.winner === true);
+    if (hasWinner) {
+      statusNorm = "final";
+    } else {
+      // Rule 2 — old start time + complete linescore context (conservative fallback)
+      // Only fires when winner flag is absent on a stale ESPN record.
+      //
+      // Conditions (ALL must be true to avoid false-positives on real matches):
+      //   A. Match started more than 4 hours ago  — a real singles match is
+      //      never longer than ~4h; tiebreaks last minutes, not hours.
+      //      4h is conservative: suspended matches can age too, but they
+      //      would need all three conditions simultaneously.
+      //   B. Both competitors have at least 2 linescore entries — means at
+      //      least 2 sets have been scored, so this isn't a pre-match stale record.
+      //   C. At least one competitor's total set wins ≥ 2 — confirms enough sets
+      //      were actually played to constitute a completed singles match.
+      //      (Doubles can finish in 2 sets, singles needs 2 to have a winner.)
+      //
+      // What this does NOT break:
+      //   - A real live tiebreak: started < 4 hours ago, so condition A fails.
+      //   - A real live 5th set: started < 4 hours ago in most cases; even if
+      //     borderline, condition C (set wins ≥ 2) is the same for live and stale.
+      //   - A suspended match from today: started < 4 hours ago → A fails.
+      //   - A suspended match from yesterday: A passes, but these are legitimate
+      //     stale-live records that SHOULD be overridden to final anyway since
+      //     a match suspended >4h with no winner flag is almost certainly done.
+      const startDate = competition?.date || event?.date;
+      const ageMs = startDate ? (Date.now() - new Date(startDate).getTime()) : 0;
+      const oldEnough = ageMs > 4 * 60 * 60 * 1000; // 4 hours in ms
+
+      if (oldEnough) {
+        const linesA = Array.isArray(a?.linescores) ? a.linescores : [];
+        const linesB = Array.isArray(b?.linescores) ? b.linescores : [];
+        const hasSufficientSets = linesA.length >= 2 && linesB.length >= 2;
+
+        if (hasSufficientSets) {
+          // Count set wins: a competitor wins a set when their linescore value
+          // is strictly greater than the opponent's for that set index.
+          const setWinsA = linesA.filter((s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)).length;
+          const setWinsB = linesB.filter((s, i) => (s?.value ?? s ?? 0) > (linesA[i]?.value ?? linesA[i] ?? 0)).length;
+          const maxSetWins = Math.max(setWinsA, setWinsB);
+
+          // At least one player has won 2+ sets → match is complete
+          if (maxSetWins >= 2) {
+            statusNorm = "final";
+          }
+        }
+      }
+    }
+  }
+
   const scheduledAt = competition?.date || event?.date || null;
 
   return {
     id: competition?.id || `${event?.id || "ev"}-${compA.displayName}-${compB.displayName}`,
-    tour,           // "ATP" or "WTA"
-    discipline,     // "singles" or "doubles"
+    tour,
+    discipline,
     tournament: event?.name || event?.shortName || tour,
     playerA: compA.displayName,
     playerB: compB.displayName,
     competitorA: compA,
     competitorB: compB,
     scoreLine: buildScoreLine(a, b),
-    // Authoritative normalized status — use this in frontend, not string guessing
-    statusNorm,     // "live" | "scheduled" | "final" | "retired" | "walkover" | "postponed" | "suspended" | "cancelled" | "unknown"
-    // Raw ESPN fields — kept for detail display
+    statusNorm,
     status: competition?.status?.type?.shortDetail || competition?.status?.type?.description || "Scheduled",
     statusDetail: competition?.status?.type?.detail || competition?.status?.type?.description || "",
     round: competition?.round?.displayName || "",
@@ -226,16 +338,21 @@ function normalizeCompetition(event, grouping, competition, tour) {
 }
 
 // ─── FETCH ONE TOUR ───────────────────────────────────────────────────────────
-async function fetchTour(url, tour) {
+// Fetches one ESPN endpoint and normalizes all competitions.
+// Tour/discipline are derived from competition metadata, not the URL.
+// Competitions that cannot be classified are silently skipped (null filter).
+async function fetchTour(url) {
   const resp = await fetch(url, { signal: AbortSignal.timeout(25000) });
-  if (!resp.ok) throw new Error(`ESPN ${tour} fetch failed: ${resp.status}`);
+  if (!resp.ok) throw new Error(`ESPN fetch failed: ${resp.status} for ${url}`);
   const raw = await resp.json();
   const events = Array.isArray(raw?.events) ? raw.events : [];
   return events.flatMap((event) => {
     const groupings = Array.isArray(event?.groupings) ? event.groupings : [];
     return groupings.flatMap((grouping) => {
       const competitions = Array.isArray(grouping?.competitions) ? grouping.competitions : [];
-      return competitions.map((comp) => normalizeCompetition(event, grouping, comp, tour));
+      return competitions
+        .map((comp) => normalizeCompetition(event, grouping, comp))
+        .filter((m) => m !== null);  // drop unclassifiable competitions
     });
   });
 }
@@ -262,20 +379,31 @@ function sortMatches(matches) {
 // ─── /api/tennis — primary endpoint ──────────────────────────────────────────
 app.get("/api/tennis", async (_req, res) => {
   try {
-    const [atpAll, wtaAll] = await Promise.allSettled([
-      fetchTour(ESPN_ATP_URL, "ATP"),
-      fetchTour(ESPN_WTA_URL, "WTA"),
+    // Fetch both endpoints in parallel. Tour/discipline come from metadata, not URL.
+    // We fetch both URLs to maximise coverage — some tournaments appear on both.
+    // Deduplication by competition.id prevents double-counting.
+    const [atpResult, wtaResult] = await Promise.allSettled([
+      fetchTour(ESPN_ATP_URL),
+      fetchTour(ESPN_WTA_URL),
     ]);
 
-    const atp = atpAll.status === "fulfilled" ? atpAll.value : [];
-    const wta = wtaAll.status === "fulfilled" ? wtaAll.value : [];
-    const atpErr = atpAll.status === "rejected" ? String(atpAll.reason) : null;
-    const wtaErr = wtaAll.status === "rejected" ? String(wtaAll.reason) : null;
+    const atpRaw = atpResult.status === "fulfilled" ? atpResult.value : [];
+    const wtaRaw = wtaResult.status === "fulfilled" ? wtaResult.value : [];
+    const atpErr = atpResult.status === "rejected" ? String(atpResult.reason) : null;
+    const wtaErr = wtaResult.status === "rejected" ? String(wtaResult.reason) : null;
 
-    const atpSingles = sortMatches(atp.filter((m) => m.discipline === "singles"));
-    const atpDoubles = sortMatches(atp.filter((m) => m.discipline === "doubles"));
-    const wtaSingles = sortMatches(wta.filter((m) => m.discipline === "singles"));
-    const wtaDoubles = sortMatches(wta.filter((m) => m.discipline === "doubles"));
+    // Merge and deduplicate by competition id
+    const seen = new Set();
+    const all = [];
+    for (const m of [...atpRaw, ...wtaRaw]) {
+      if (!seen.has(m.id)) { seen.add(m.id); all.push(m); }
+    }
+
+    // Split into 4 buckets using tour+discipline fields derived from metadata
+    const atpSingles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "singles"));
+    const atpDoubles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "doubles"));
+    const wtaSingles = sortMatches(all.filter((m) => m.tour === "WTA" && m.discipline === "singles"));
+    const wtaDoubles = sortMatches(all.filter((m) => m.tour === "WTA" && m.discipline === "doubles"));
 
     return res.json({
       updatedAt: new Date().toISOString(),
@@ -297,16 +425,14 @@ app.get("/api/tennis", async (_req, res) => {
 });
 
 // ─── /api/atp — legacy compatibility ─────────────────────────────────────────
-// Keeps working for any client still hitting the old endpoint.
-// Returns { singles, doubles } shaped from ATP data only.
 app.get("/api/atp", async (_req, res) => {
   try {
-    const atp = await fetchTour(ESPN_ATP_URL, "ATP");
-    const singles = sortMatches(atp.filter((m) => m.discipline === "singles"));
-    const doubles = sortMatches(atp.filter((m) => m.discipline === "doubles"));
+    const all = await fetchTour(ESPN_ATP_URL);
+    const singles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "singles"));
+    const doubles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "doubles"));
     return res.json({
       updatedAt: new Date().toISOString(),
-      count: atp.length,
+      count: singles.length + doubles.length,
       singles,
       doubles,
     });
