@@ -71,30 +71,40 @@ function parseRankingsList(entry) {
   if (!entry) return null;
   const ranks = Array.isArray(entry.ranks) ? entry.ranks : [];
   if (ranks.length === 0) return null;
-  return ranks.map((r, idx) => ({
+  const list = ranks.map((r, idx) => ({
     rank:   r?.current ?? r?.rank ?? (idx + 1),
     name:   r?.athlete?.displayName || r?.athlete?.fullName || r?.displayName || "Unknown",
     points: r?.points ?? r?.rankingPoints ?? null,
   })).filter(r => r.name !== "Unknown");
+  // Limit to top 150 — do not show more than 150 players in any rankings list
+  return list.length > 0 ? list.slice(0, 150) : null;
 }
 
 function parseRankingsResponse(raw, tour) {
   const list = Array.isArray(raw?.rankings) ? raw.rankings : [];
-  // Log all category names found for debugging
   const categoryNames = list.map(r => r?.name || "(unnamed)");
-  console.log(`[rankings] ${tour} categories found: [${categoryNames.join(", ")}]`);
+  console.log(`[rankings] ${tour} categories found: [${categoryNames.join(", ")}]  total categories: ${list.length}`);
+  // Log first entry shape for debugging WTA differences
+  if (list[0]) {
+    const firstRanksLen = Array.isArray(list[0].ranks) ? list[0].ranks.length : "not-array";
+    console.log(`[rankings] ${tour} first category: name="${list[0].name}" ranks=${firstRanksLen}`);
+    if (Array.isArray(list[0].ranks) && list[0].ranks[0]) {
+      const sample = list[0].ranks[0];
+      console.log(`[rankings] ${tour} sample rank[0]: current=${sample.current} points=${sample.points} athlete="${sample.athlete?.displayName}"`);
+    }
+  }
 
   // Doubles: any entry whose name contains "doubles" (case-insensitive)
   const doublesEntry = list.find(r => (r?.name || "").toLowerCase().includes("doubles"));
 
-  // Singles: first entry that is NOT the doubles entry
-  // This correctly handles "ATP", "ATP Singles", "WTA", "WTA Singles" etc.
+  // Singles: first entry that is NOT the doubles entry AND has at least one rank.
+  // Works for "ATP" (confirmed), "WTA", "ATP Singles", "WTA Singles", etc.
   const singlesEntry = list.find(r => r !== doublesEntry && Array.isArray(r?.ranks) && r.ranks.length > 0);
 
   const singles = parseRankingsList(singlesEntry);
   const doubles = parseRankingsList(doublesEntry);
 
-  console.log(`[rankings] ${tour} singles=${singles?.length ?? "null"} doubles=${doubles?.length ?? "null"}`);
+  console.log(`[rankings] ${tour} parsed: singles=${singles?.length ?? "null"} doubles=${doubles?.length ?? "null"}`);
   return { singles, doubles };
 }
 
@@ -700,6 +710,34 @@ app.get("/api/tournaments", async (_req, res) => {
   }
 });
 
+// ─── /api/rankings/debug — raw ESPN rankings response for schema inspection ───
+// Use this to diagnose WTA/doubles parsing: open in browser to see exact shape.
+app.get("/api/rankings/debug", async (req, res) => {
+  const tour = String(req.query?.tour || "atp").toUpperCase() === "WTA" ? "WTA" : "ATP";
+  const url  = tour === "WTA" ? ESPN_WTA_RANKINGS : ESPN_ATP_RANKINGS;
+  try {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!resp.ok) return res.status(502).json({ tour, url, error: `HTTP ${resp.status}` });
+    const raw  = await resp.json();
+    const list = Array.isArray(raw?.rankings) ? raw.rankings : [];
+    return res.json({
+      tour, url,
+      categoryCount: list.length,
+      categories: list.map(r => ({
+        name:      r?.name,
+        type:      r?.type,
+        ranksLen:  Array.isArray(r?.ranks) ? r.ranks.length : "not-array",
+        sample:    Array.isArray(r?.ranks) && r.ranks[0] ? {
+          current: r.ranks[0].current,
+          rank:    r.ranks[0].rank,
+          points:  r.ranks[0].points,
+          athlete: r.ranks[0].athlete?.displayName,
+        } : null,
+      })),
+    });
+  } catch(e) { return res.status(500).json({ tour, url, error: String(e) }); }
+});
+
 // ─── /api/rankings — ATP or WTA rankings from ESPN rankings endpoint ──────────
 // Returns { singles: [{rank, name, points}], doubles: [...] | null }
 // doubles is null (not []) when ESPN doesn't expose it for that tour/category.
@@ -786,9 +824,10 @@ app.get("/api/debug", async (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Tennis Mode backend running on port ${PORT}`);
-  console.log(`  GET /api/tennis           — ATP + WTA combined (today + yesterday)`);
-  console.log(`  GET /api/tournaments      — unique tournaments with dates + status`);
-  console.log(`  GET /api/rankings?tour=   — ATP or WTA top 100 rankings (cached 6h)`);
-  console.log(`  GET /api/atp              — ATP only (legacy)`);
-  console.log(`  GET /api/debug?tour=      — raw ESPN schema`);
+  console.log(`  GET /api/tennis             — ATP + WTA combined (today + yesterday)`);
+  console.log(`  GET /api/tournaments        — unique tournaments with dates + status`);
+  console.log(`  GET /api/rankings?tour=     — ATP or WTA top 150 rankings (cached 6h)`);
+  console.log(`  GET /api/rankings/debug?tour= — raw ESPN rankings shape (for debugging)`);
+  console.log(`  GET /api/atp                — ATP only (legacy)`);
+  console.log(`  GET /api/debug?tour=        — raw ESPN scoreboard schema`);
 });
