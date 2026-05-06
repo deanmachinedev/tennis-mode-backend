@@ -42,35 +42,60 @@ function fmtDateRange(start, end, derived) {
 // ─── RANKINGS CACHE ───────────────────────────────────────────────────────────
 // ESPN rankings endpoint returns singles and doubles categories in one response.
 // Cache: 6 hours (rankings update weekly).
+// IMPORTANT: only cache when singles has real rows — never cache null/null.
 const RANKINGS_TTL_MS = 6 * 60 * 60 * 1000;
 const rankingsCache = {
   atp: null, atpAt: 0,   // { singles: [...], doubles: [...] | null }
   wta: null, wtaAt: 0,
 };
 
-// Correct ESPN rankings URLs (confirmed working — not the /athletes endpoint which 404s)
+// Correct ESPN rankings URLs (confirmed working)
 const ESPN_ATP_RANKINGS = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/atp/rankings?region=us&lang=en";
 const ESPN_WTA_RANKINGS = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/wta/rankings?region=us&lang=en";
 
-// Parse one category from ESPN rankings response.
-// ESPN response shape:
-//   { rankings: [ { name: "ATP Singles", ranks: [ { current, athlete.displayName, points } ] } ] }
-// Singles/doubles detected by name.toLowerCase() containing "singles" or "doubles".
-// Returns null if the category entry is absent (doubles may not exist for all tours).
-function parseRankingsCategory(raw, categoryType) {
-  const list = Array.isArray(raw?.rankings) ? raw.rankings : [];
-  const entry = list.find(r => {
-    const n = (r?.name || r?.type || "").toLowerCase();
-    return categoryType === "singles" ? n.includes("singles") : n.includes("doubles");
-  });
-  if (!entry) return null;   // category genuinely absent — not an error, just unavailable
-  const ranks = Array.isArray(entry?.ranks) ? entry.ranks : [];
+// Parse the ESPN rankings response into { singles, doubles }.
+//
+// Confirmed ESPN response shape (tested 2025-05):
+//   rankings[0].name = "ATP"  (NOT "ATP Singles" — just the tour name)
+//   rankings[0].ranks = [ { current: 1, athlete: { displayName: "Carlos Alcaraz" }, points: 13590 }, ... ]
+//
+// Detection strategy:
+//   1. If any entry name contains "doubles" → that entry is doubles.
+//   2. The FIRST entry whose name does NOT contain "doubles" → treat as singles.
+//      This covers both "ATP Singles" (if ESPN ever adds it) and plain "ATP".
+//   3. If no non-doubles entry exists → singles = null.
+//   4. If no doubles entry exists → doubles = null (show "unavailable" on front end).
+//
+// Never fabricates data. Returns null for a category when ESPN doesn't provide it.
+function parseRankingsList(entry) {
+  if (!entry) return null;
+  const ranks = Array.isArray(entry.ranks) ? entry.ranks : [];
   if (ranks.length === 0) return null;
   return ranks.map((r, idx) => ({
     rank:   r?.current ?? r?.rank ?? (idx + 1),
     name:   r?.athlete?.displayName || r?.athlete?.fullName || r?.displayName || "Unknown",
     points: r?.points ?? r?.rankingPoints ?? null,
   })).filter(r => r.name !== "Unknown");
+}
+
+function parseRankingsResponse(raw, tour) {
+  const list = Array.isArray(raw?.rankings) ? raw.rankings : [];
+  // Log all category names found for debugging
+  const categoryNames = list.map(r => r?.name || "(unnamed)");
+  console.log(`[rankings] ${tour} categories found: [${categoryNames.join(", ")}]`);
+
+  // Doubles: any entry whose name contains "doubles" (case-insensitive)
+  const doublesEntry = list.find(r => (r?.name || "").toLowerCase().includes("doubles"));
+
+  // Singles: first entry that is NOT the doubles entry
+  // This correctly handles "ATP", "ATP Singles", "WTA", "WTA Singles" etc.
+  const singlesEntry = list.find(r => r !== doublesEntry && Array.isArray(r?.ranks) && r.ranks.length > 0);
+
+  const singles = parseRankingsList(singlesEntry);
+  const doubles = parseRankingsList(doublesEntry);
+
+  console.log(`[rankings] ${tour} singles=${singles?.length ?? "null"} doubles=${doubles?.length ?? "null"}`);
+  return { singles, doubles };
 }
 
 async function fetchRankings(tour) {
@@ -80,8 +105,11 @@ async function fetchRankings(tour) {
   const atKey  = isWta ? "wtaAt" : "atpAt";
   const url    = isWta ? ESPN_WTA_RANKINGS : ESPN_ATP_RANKINGS;
 
-  // Return cached if fresh
-  if (rankingsCache[key] && (now - rankingsCache[atKey]) < RANKINGS_TTL_MS) {
+  // Return cached only if fresh AND the cached data has real singles rows.
+  // A null/null result was never cached (see below), so this check is safe.
+  if (rankingsCache[key] &&
+      rankingsCache[key].singles?.length > 0 &&
+      (now - rankingsCache[atKey]) < RANKINGS_TTL_MS) {
     return { data: rankingsCache[key], cached: true, cachedAt: new Date(rankingsCache[atKey]).toISOString() };
   }
 
@@ -91,16 +119,19 @@ async function fetchRankings(tour) {
     console.error(`[rankings] ${tour} fetch failed: HTTP ${resp.status} for ${url}`);
     throw new Error(`ESPN rankings HTTP ${resp.status} for ${url}`);
   }
-  const raw = await resp.json();
-  console.log(`[rankings] ${tour} raw categories: ${(raw?.rankings||[]).map(r=>r?.name).join(", ")}`);
+  const raw  = await resp.json();
+  const data = parseRankingsResponse(raw, tour);
 
-  const singles = parseRankingsCategory(raw, "singles");
-  const doubles = parseRankingsCategory(raw, "doubles");
-  console.log(`[rankings] ${tour} singles=${singles?.length ?? "null"} doubles=${doubles?.length ?? "null"}`);
+  // Only cache when singles has real rows — do NOT cache null/null failures.
+  // A bad parse or empty ESPN response will not poison the cache.
+  if (data.singles && data.singles.length > 0) {
+    rankingsCache[key]  = data;
+    rankingsCache[atKey] = now;
+    console.log(`[rankings] ${tour} cached ${data.singles.length} singles, ${data.doubles?.length ?? 0} doubles`);
+  } else {
+    console.warn(`[rankings] ${tour} not caching — singles is empty or null`);
+  }
 
-  const data = { singles, doubles };   // null means unavailable, [] would mean empty but present
-  rankingsCache[key]  = data;
-  rankingsCache[atKey] = now;
   return { data, cached: false, cachedAt: new Date(now).toISOString() };
 }
 
