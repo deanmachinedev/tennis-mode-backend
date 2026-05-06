@@ -15,6 +15,86 @@ function espnDate(offsetDays = 0) {
   return d.toISOString().slice(0, 10).replace(/-/g, "");
 }
 
+// Format a date string into "Apr 22" style for display
+function fmtDate(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+// Format a tournament date range from start/end ISO strings.
+// Returns null if no usable dates. Labels with "(est)" when derived from match dates.
+function fmtDateRange(start, end, derived) {
+  const s = fmtDate(start);
+  const e = fmtDate(end);
+  if (!s && !e) return null;
+  const suffix = derived ? " (est)" : "";
+  if (!e || s === e) return `${s}${suffix}`;
+  // Same month: "Apr 22 - 29"
+  const sd = new Date(start); const ed = new Date(end);
+  if (!isNaN(sd) && !isNaN(ed) && sd.getUTCMonth() === ed.getUTCMonth()) {
+    return `${s} - ${ed.getUTCDate()}${suffix}`;
+  }
+  return `${s} - ${e}${suffix}`;
+}
+
+// ─── RANKINGS CACHE ───────────────────────────────────────────────────────────
+// Rankings are fetched from ESPN's athletes endpoint and cached for 6 hours.
+// ESPN tennis rankings update weekly; 6-hour cache avoids hammering the API.
+const RANKINGS_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const rankingsCache = { atp: null, wta: null, atpAt: 0, wtaAt: 0 };
+
+const ESPN_ATP_ATHLETES = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/atp/athletes";
+const ESPN_WTA_ATHLETES = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/wta/athletes";
+
+async function fetchRankings(tour) {
+  const isWta = tour === "WTA";
+  const now   = Date.now();
+  const key   = isWta ? "wta" : "atp";
+  const atKey = isWta ? "wtaAt" : "atpAt";
+
+  // Return cached if still fresh
+  if (rankingsCache[key] && (now - rankingsCache[atKey]) < RANKINGS_TTL_MS) {
+    return { rankings: rankingsCache[key], cached: true, cachedAt: new Date(rankingsCache[atKey]).toISOString() };
+  }
+
+  const baseUrl = isWta ? ESPN_WTA_ATHLETES : ESPN_ATP_ATHLETES;
+  // ESPN athletes endpoint: limit=100 returns top 100, sorted by rank
+  const url = `${baseUrl}?limit=100&enable=rankings`;
+  const resp = await fetch(url, { signal: AbortSignal.timeout(20000) });
+  if (!resp.ok) throw new Error(`ESPN athletes ${resp.status}`);
+  const raw = await resp.json();
+
+  // ESPN athletes response: raw.athletes[] — each has displayName, rank, statistics
+  // Rankings points live in athlete.statistics[] where displayName includes "Points"
+  // OR in athlete.rankings[].value / athlete.rankings[].displayValue
+  const athletes = Array.isArray(raw?.athletes) ? raw.athletes : [];
+  const rankings = athletes.map((a, idx) => {
+    const name = a?.displayName || a?.fullName || "Unknown";
+    // Try explicit rank field first, fall back to array position
+    const rank = a?.rank ?? a?.rankings?.[0]?.current ?? (idx + 1);
+    // Points: look in statistics for a "points" entry
+    let points = null;
+    const stats = Array.isArray(a?.statistics) ? a.statistics : [];
+    for (const s of stats) {
+      const n = (s?.name || s?.displayName || "").toLowerCase();
+      if (n.includes("point") || n.includes("pts")) { points = s?.displayValue ?? s?.value ?? null; break; }
+    }
+    // Also check rankings[].value which ESPN uses for ranking points
+    if (points === null && Array.isArray(a?.rankings)) {
+      for (const r of a.rankings) {
+        if (r?.value != null) { points = String(r.value); break; }
+      }
+    }
+    return { rank: Number(rank) || idx + 1, name, points };
+  }).filter(r => r.name !== "Unknown").sort((a, b) => a.rank - b.rank);
+
+  rankingsCache[key]  = rankings;
+  rankingsCache[atKey] = now;
+  return { rankings, cached: false, cachedAt: new Date(now).toISOString() };
+}
+
 // Fetch one ESPN endpoint with an optional date override
 async function fetchTourUrl(url) {
   const resp = await fetch(url, { signal: AbortSignal.timeout(25000) });
@@ -372,7 +452,9 @@ function normalizeCompetition(event, grouping, competition) {
     }
   }
 
-  const scheduledAt = competition?.date || event?.date || null;
+  const scheduledAt   = competition?.date || event?.date || null;
+  const eventStartAt  = event?.date || null;
+  const eventEndAt    = event?.endDate || null;   // present when ESPN exposes full tournament dates
 
   return {
     id: competition?.id || `${event?.id || "ev"}-${compA.displayName}-${compB.displayName}`,
@@ -390,6 +472,8 @@ function normalizeCompetition(event, grouping, competition) {
     round: competition?.round?.displayName || "",
     court: competition?.venue?.court || competition?.venue?.fullName || "",
     scheduledAt,
+    eventStartAt,
+    eventEndAt,
     notes: extractNotes(competition),
     groupName: grouping?.grouping?.displayName || "",
   };
@@ -499,7 +583,7 @@ app.get("/api/tennis", async (_req, res) => {
   }
 });
 
-// ─── /api/tournaments — unique tournament names with status summary ────────────
+// ─── /api/tournaments — unique tournament names with status summary + dates ────
 app.get("/api/tournaments", async (_req, res) => {
   try {
     const [atpResult, wtaResult] = await Promise.allSettled([
@@ -510,26 +594,102 @@ app.get("/api/tournaments", async (_req, res) => {
       ...(atpResult.status === "fulfilled" ? atpResult.value : []),
       ...(wtaResult.status === "fulfilled" ? wtaResult.value : []),
     ];
-    // Collect unique tournaments with counts per status
+
+    // Collect unique tournaments with counts per status and date tracking.
+    // Date strategy:
+    //   1. eventStartAt / eventEndAt — ESPN's own tournament-level date fields.
+    //      If present these are the authoritative official tournament dates.
+    //   2. If eventEndAt is absent, derive an estimated end from the latest
+    //      individual match date (scheduledAt) in that tournament.
+    //   3. If no dates at all, dateRange is null (omitted on front end).
     const map = new Map();
     for (const m of all) {
       const key = `${m.tour}::${m.tournament}`;
       if (!map.has(key)) {
-        map.set(key, { tour: m.tour, name: m.tournament, live: 0, final: 0, scheduled: 0 });
+        map.set(key, {
+          tour: m.tour, name: m.tournament,
+          live: 0, final: 0, scheduled: 0,
+          // Official dates from ESPN event-level fields
+          startAt: m.eventStartAt || null,
+          endAt:   m.eventEndAt   || null,
+          // Derived: min/max of individual match dates (fallback)
+          minMatchDate: null, maxMatchDate: null,
+          hasOfficialEnd: !!m.eventEndAt,
+        });
       }
       const t = map.get(key);
       if (m.statusNorm === "live") t.live++;
       else if (["final","retired","walkover"].includes(m.statusNorm)) t.final++;
       else if (m.statusNorm === "scheduled") t.scheduled++;
+
+      // Track per-tournament start (min) — use earlier of official start vs match date
+      if (m.eventStartAt) {
+        if (!t.startAt || m.eventStartAt < t.startAt) t.startAt = m.eventStartAt;
+      }
+      // Track latest official end
+      if (m.eventEndAt && (!t.endAt || m.eventEndAt > t.endAt)) {
+        t.endAt = m.eventEndAt;
+        t.hasOfficialEnd = true;
+      }
+      // Track match-level date spread for fallback
+      if (m.scheduledAt) {
+        if (!t.minMatchDate || m.scheduledAt < t.minMatchDate) t.minMatchDate = m.scheduledAt;
+        if (!t.maxMatchDate || m.scheduledAt > t.maxMatchDate) t.maxMatchDate = m.scheduledAt;
+      }
     }
-    const tournaments = [...map.values()].sort((a, b) => {
-      // Active (live) tournaments first, then completed, then scheduled
+
+    const tournaments = [...map.values()].map(t => {
+      // Resolve best available date range
+      const start  = t.startAt || t.minMatchDate || null;
+      const end    = t.endAt   || (t.hasOfficialEnd ? null : t.maxMatchDate) || null;
+      const derived = !t.hasOfficialEnd;  // true = range estimated from match dates
+      return {
+        tour: t.tour, name: t.name,
+        live: t.live, final: t.final, scheduled: t.scheduled,
+        dateRange: fmtDateRange(start, end, derived),
+        dateSource: t.hasOfficialEnd ? "espn" : (start ? "derived" : null),
+      };
+    }).sort((a, b) => {
       const score = t => (t.live > 0 ? 0 : t.scheduled > 0 ? 1 : 2);
       return score(a) - score(b) || a.name.localeCompare(b.name);
     });
+
     return res.json({ updatedAt: new Date().toISOString(), tournaments });
   } catch (error) {
     return res.status(500).json({ error: String(error) });
+  }
+});
+
+// ─── /api/rankings — ATP or WTA rankings from ESPN athletes endpoint ──────────
+// Cache: 6 hours (rankings update weekly, so this is safe and efficient).
+// Fallback: if fetch fails and cache exists, returns stale cache with cachedAt label.
+// If no cache and fetch fails, returns empty list with error.
+app.get("/api/rankings", async (req, res) => {
+  const tour = String(req.query?.tour || "atp").toUpperCase() === "WTA" ? "WTA" : "ATP";
+  try {
+    const result = await fetchRankings(tour);
+    return res.json({
+      tour,
+      updatedAt: new Date().toISOString(),
+      cachedAt: result.cachedAt,
+      fromCache: result.cached,
+      count: result.rankings.length,
+      rankings: result.rankings,
+    });
+  } catch (error) {
+    // If fetch failed but we have a stale cache, return it with a warning
+    const key = tour === "WTA" ? "wta" : "atp";
+    if (rankingsCache[key]) {
+      return res.json({
+        tour, updatedAt: new Date().toISOString(),
+        cachedAt: new Date(rankingsCache[tour === "WTA" ? "wtaAt" : "atpAt"]).toISOString(),
+        fromCache: true, stale: true,
+        count: rankingsCache[key].length,
+        rankings: rankingsCache[key],
+        warning: `Live fetch failed: ${String(error)}. Showing stale data.`,
+      });
+    }
+    return res.status(502).json({ tour, rankings: [], error: String(error) });
   }
 });
 
@@ -578,8 +738,9 @@ app.get("/api/debug", async (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Tennis Mode backend running on port ${PORT}`);
-  console.log(`  GET /api/tennis      — ATP + WTA combined (today + yesterday)`);
-  console.log(`  GET /api/tournaments — unique tournaments with status summary`);
-  console.log(`  GET /api/atp         — ATP only (legacy)`);
-  console.log(`  GET /api/debug?tour=atp|wta — raw ESPN schema`);
+  console.log(`  GET /api/tennis           — ATP + WTA combined (today + yesterday)`);
+  console.log(`  GET /api/tournaments      — unique tournaments with dates + status`);
+  console.log(`  GET /api/rankings?tour=   — ATP or WTA top 100 rankings (cached 6h)`);
+  console.log(`  GET /api/atp              — ATP only (legacy)`);
+  console.log(`  GET /api/debug?tour=      — raw ESPN schema`);
 });
