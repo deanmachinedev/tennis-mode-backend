@@ -40,59 +40,68 @@ function fmtDateRange(start, end, derived) {
 }
 
 // ─── RANKINGS CACHE ───────────────────────────────────────────────────────────
-// Rankings are fetched from ESPN's athletes endpoint and cached for 6 hours.
-// ESPN tennis rankings update weekly; 6-hour cache avoids hammering the API.
-const RANKINGS_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const rankingsCache = { atp: null, wta: null, atpAt: 0, wtaAt: 0 };
+// ESPN rankings endpoint returns singles and doubles categories in one response.
+// Cache: 6 hours (rankings update weekly).
+const RANKINGS_TTL_MS = 6 * 60 * 60 * 1000;
+const rankingsCache = {
+  atp: null, atpAt: 0,   // { singles: [...], doubles: [...] | null }
+  wta: null, wtaAt: 0,
+};
 
-const ESPN_ATP_ATHLETES = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/atp/athletes";
-const ESPN_WTA_ATHLETES = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/wta/athletes";
+// Correct ESPN rankings URLs (confirmed working — not the /athletes endpoint which 404s)
+const ESPN_ATP_RANKINGS = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/atp/rankings?region=us&lang=en";
+const ESPN_WTA_RANKINGS = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/wta/rankings?region=us&lang=en";
+
+// Parse one category from ESPN rankings response.
+// ESPN response shape:
+//   { rankings: [ { name: "ATP Singles", ranks: [ { current, athlete.displayName, points } ] } ] }
+// Singles/doubles detected by name.toLowerCase() containing "singles" or "doubles".
+// Returns null if the category entry is absent (doubles may not exist for all tours).
+function parseRankingsCategory(raw, categoryType) {
+  const list = Array.isArray(raw?.rankings) ? raw.rankings : [];
+  const entry = list.find(r => {
+    const n = (r?.name || r?.type || "").toLowerCase();
+    return categoryType === "singles" ? n.includes("singles") : n.includes("doubles");
+  });
+  if (!entry) return null;   // category genuinely absent — not an error, just unavailable
+  const ranks = Array.isArray(entry?.ranks) ? entry.ranks : [];
+  if (ranks.length === 0) return null;
+  return ranks.map((r, idx) => ({
+    rank:   r?.current ?? r?.rank ?? (idx + 1),
+    name:   r?.athlete?.displayName || r?.athlete?.fullName || r?.displayName || "Unknown",
+    points: r?.points ?? r?.rankingPoints ?? null,
+  })).filter(r => r.name !== "Unknown");
+}
 
 async function fetchRankings(tour) {
-  const isWta = tour === "WTA";
-  const now   = Date.now();
-  const key   = isWta ? "wta" : "atp";
-  const atKey = isWta ? "wtaAt" : "atpAt";
+  const isWta  = tour === "WTA";
+  const now    = Date.now();
+  const key    = isWta ? "wta" : "atp";
+  const atKey  = isWta ? "wtaAt" : "atpAt";
+  const url    = isWta ? ESPN_WTA_RANKINGS : ESPN_ATP_RANKINGS;
 
-  // Return cached if still fresh
+  // Return cached if fresh
   if (rankingsCache[key] && (now - rankingsCache[atKey]) < RANKINGS_TTL_MS) {
-    return { rankings: rankingsCache[key], cached: true, cachedAt: new Date(rankingsCache[atKey]).toISOString() };
+    return { data: rankingsCache[key], cached: true, cachedAt: new Date(rankingsCache[atKey]).toISOString() };
   }
 
-  const baseUrl = isWta ? ESPN_WTA_ATHLETES : ESPN_ATP_ATHLETES;
-  // ESPN athletes endpoint: limit=100 returns top 100, sorted by rank
-  const url = `${baseUrl}?limit=100&enable=rankings`;
+  console.log(`[rankings] Fetching ${tour}: ${url}`);
   const resp = await fetch(url, { signal: AbortSignal.timeout(20000) });
-  if (!resp.ok) throw new Error(`ESPN athletes ${resp.status}`);
+  if (!resp.ok) {
+    console.error(`[rankings] ${tour} fetch failed: HTTP ${resp.status} for ${url}`);
+    throw new Error(`ESPN rankings HTTP ${resp.status} for ${url}`);
+  }
   const raw = await resp.json();
+  console.log(`[rankings] ${tour} raw categories: ${(raw?.rankings||[]).map(r=>r?.name).join(", ")}`);
 
-  // ESPN athletes response: raw.athletes[] — each has displayName, rank, statistics
-  // Rankings points live in athlete.statistics[] where displayName includes "Points"
-  // OR in athlete.rankings[].value / athlete.rankings[].displayValue
-  const athletes = Array.isArray(raw?.athletes) ? raw.athletes : [];
-  const rankings = athletes.map((a, idx) => {
-    const name = a?.displayName || a?.fullName || "Unknown";
-    // Try explicit rank field first, fall back to array position
-    const rank = a?.rank ?? a?.rankings?.[0]?.current ?? (idx + 1);
-    // Points: look in statistics for a "points" entry
-    let points = null;
-    const stats = Array.isArray(a?.statistics) ? a.statistics : [];
-    for (const s of stats) {
-      const n = (s?.name || s?.displayName || "").toLowerCase();
-      if (n.includes("point") || n.includes("pts")) { points = s?.displayValue ?? s?.value ?? null; break; }
-    }
-    // Also check rankings[].value which ESPN uses for ranking points
-    if (points === null && Array.isArray(a?.rankings)) {
-      for (const r of a.rankings) {
-        if (r?.value != null) { points = String(r.value); break; }
-      }
-    }
-    return { rank: Number(rank) || idx + 1, name, points };
-  }).filter(r => r.name !== "Unknown").sort((a, b) => a.rank - b.rank);
+  const singles = parseRankingsCategory(raw, "singles");
+  const doubles = parseRankingsCategory(raw, "doubles");
+  console.log(`[rankings] ${tour} singles=${singles?.length ?? "null"} doubles=${doubles?.length ?? "null"}`);
 
-  rankingsCache[key]  = rankings;
+  const data = { singles, doubles };   // null means unavailable, [] would mean empty but present
+  rankingsCache[key]  = data;
   rankingsCache[atKey] = now;
-  return { rankings, cached: false, cachedAt: new Date(now).toISOString() };
+  return { data, cached: false, cachedAt: new Date(now).toISOString() };
 }
 
 // Fetch one ESPN endpoint with an optional date override
@@ -660,36 +669,44 @@ app.get("/api/tournaments", async (_req, res) => {
   }
 });
 
-// ─── /api/rankings — ATP or WTA rankings from ESPN athletes endpoint ──────────
-// Cache: 6 hours (rankings update weekly, so this is safe and efficient).
-// Fallback: if fetch fails and cache exists, returns stale cache with cachedAt label.
-// If no cache and fetch fails, returns empty list with error.
+// ─── /api/rankings — ATP or WTA rankings from ESPN rankings endpoint ──────────
+// Returns { singles: [{rank, name, points}], doubles: [...] | null }
+// doubles is null (not []) when ESPN doesn't expose it for that tour/category.
+// Cache: 6 hours. Stale cache returned with warning on live fetch failure.
 app.get("/api/rankings", async (req, res) => {
   const tour = String(req.query?.tour || "atp").toUpperCase() === "WTA" ? "WTA" : "ATP";
   try {
     const result = await fetchRankings(tour);
     return res.json({
       tour,
-      updatedAt: new Date().toISOString(),
-      cachedAt: result.cachedAt,
-      fromCache: result.cached,
-      count: result.rankings.length,
-      rankings: result.rankings,
+      updatedAt:  new Date().toISOString(),
+      cachedAt:   result.cachedAt,
+      fromCache:  result.cached,
+      singles:    result.data.singles,    // [{rank, name, points}] or null
+      doubles:    result.data.doubles,    // [{rank, name, points}] or null
+      singlesCount: result.data.singles?.length ?? 0,
+      doublesCount: result.data.doubles?.length ?? 0,
     });
   } catch (error) {
-    // If fetch failed but we have a stale cache, return it with a warning
+    // Return stale cache with warning if available
     const key = tour === "WTA" ? "wta" : "atp";
     if (rankingsCache[key]) {
+      const atKey = tour === "WTA" ? "wtaAt" : "atpAt";
       return res.json({
         tour, updatedAt: new Date().toISOString(),
-        cachedAt: new Date(rankingsCache[tour === "WTA" ? "wtaAt" : "atpAt"]).toISOString(),
+        cachedAt: new Date(rankingsCache[atKey]).toISOString(),
         fromCache: true, stale: true,
-        count: rankingsCache[key].length,
-        rankings: rankingsCache[key],
-        warning: `Live fetch failed: ${String(error)}. Showing stale data.`,
+        singles:  rankingsCache[key].singles,
+        doubles:  rankingsCache[key].doubles,
+        warning:  `Live fetch failed: ${String(error)}. Showing stale data.`,
       });
     }
-    return res.status(502).json({ tour, rankings: [], error: String(error) });
+    // No cache — return explicit error so frontend can show "Rankings unavailable"
+    console.error(`[rankings] ${tour} failed, no cache: ${String(error)}`);
+    return res.status(502).json({
+      tour, singles: null, doubles: null,
+      error: String(error),
+    });
   }
 });
 
