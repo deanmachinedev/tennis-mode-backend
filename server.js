@@ -120,28 +120,50 @@ async function fetchAthleteProfile(league, espnId) {
   // Log ALL top-level keys so we can see the real shape without guessing
   console.log(`[athlete] ${league}/${espnId} top-level keys: ${Object.keys(raw).join(", ")}`);
 
-  // Country: ESPN has used several different field names across API versions.
-  // Try each in order of reliability. Log what we find.
+  // ── Birthplace ───────────────────────────────────────────────────────────────
+  // ESPN returns this field as lowercase "birthplace" (NOT "birthPlace" camelCase).
+  // Shape observed: { city: "San Candido", country: { description: "Italy" } }
+  // We support both casings defensively.
+  const bp        = raw.birthplace ?? raw.birthPlace ?? null;
+  // birthplace.country may be: { description: "Italy" } | { displayName: "Italy" } | "Italy" | null
+  const bpCountry = bp
+    ? (typeof bp.country === "string" ? bp.country
+        : bp.country?.description ?? bp.country?.displayName ?? bp.country?.name ?? null)
+    : null;
+  // birthplace city/state string — used only for "Born:" display, never as country fallback
+  const bpCity    = bp
+    ? (bp.city ?? bp.displayName ?? (typeof bp === "string" ? bp : null))
+    : null;
+  // Full birthplace string e.g. "San Candido, Italy" — only built when we have real subfields
+  const birthplaceStr = bpCity
+    ? (bpCountry ? `${bpCity}, ${bpCountry}` : bpCity)
+    : (bpCountry ?? null);
+
+  console.log(`[athlete] ${league}/${espnId} birthplace raw: ${JSON.stringify(bp)} → city="${bpCity}" country="${bpCountry}"`);
+
+  // ── Country resolution ───────────────────────────────────────────────────────
+  // Priority: direct fields first, then country extracted from birthplace.
+  // We DO NOT guess country from city name alone.
   const countryRaw = (
-    raw.citizenship                                          // string "Italy"
-    ?? raw.citizenshipCountry?.name                         // nested object
-    ?? raw.citizenshipCountry?.displayName
-    ?? raw.birthPlace?.country?.description                  // birthPlace.country
-    ?? raw.birthPlace?.country?.displayName
+    raw.citizenship                                                 // string "Italy"
+    ?? raw.citizenshipCountry?.displayName                          // nested object
+    ?? raw.citizenshipCountry?.name
     ?? (typeof raw.nationality === "string" ? raw.nationality : null)
     ?? raw.nationality?.displayName
     ?? raw.nationality?.name
+    ?? (typeof raw.country === "string" ? raw.country : null)
     ?? raw.country?.description
     ?? raw.country?.displayName
-    ?? (typeof raw.country === "string" ? raw.country : null)
+    ?? bpCountry                                                    // from birthplace.country
     ?? null
   );
-  console.log(`[athlete] ${league}/${espnId} country fields: citizenship="${raw.citizenship}" citizenshipCountry="${JSON.stringify(raw.citizenshipCountry)}" birthPlace="${JSON.stringify(raw.birthPlace)}" nationality="${JSON.stringify(raw.nationality)}" → resolved="${countryRaw}"`);
+  console.log(`[athlete] ${league}/${espnId} country resolved: "${countryRaw}"`);
 
   const profile = {
     id:          String(raw.id || espnId),
     displayName: raw.displayName || raw.fullName || null,
     country:     countryRaw,
+    birthplace:  birthplaceStr,          // "San Candido, Italy" or just "San Candido" or null
     hand:        (typeof raw.hand === "object" ? raw.hand?.displayValue : raw.hand) || null,
     age:         raw.age != null ? Number(raw.age) : null,
     heightIn:    raw.height ? Number(raw.height) : null,
