@@ -117,33 +117,63 @@ async function fetchAthleteProfile(league, espnId) {
   }
   const raw = await resp.json();
 
-  // Extract only the fields we know are reliably present
+  // Log ALL top-level keys so we can see the real shape without guessing
+  console.log(`[athlete] ${league}/${espnId} top-level keys: ${Object.keys(raw).join(", ")}`);
+
+  // Country: ESPN has used several different field names across API versions.
+  // Try each in order of reliability. Log what we find.
+  const countryRaw = (
+    raw.citizenship                                          // string "Italy"
+    ?? raw.citizenshipCountry?.name                         // nested object
+    ?? raw.citizenshipCountry?.displayName
+    ?? raw.birthPlace?.country?.description                  // birthPlace.country
+    ?? raw.birthPlace?.country?.displayName
+    ?? (typeof raw.nationality === "string" ? raw.nationality : null)
+    ?? raw.nationality?.displayName
+    ?? raw.nationality?.name
+    ?? raw.country?.description
+    ?? raw.country?.displayName
+    ?? (typeof raw.country === "string" ? raw.country : null)
+    ?? null
+  );
+  console.log(`[athlete] ${league}/${espnId} country fields: citizenship="${raw.citizenship}" citizenshipCountry="${JSON.stringify(raw.citizenshipCountry)}" birthPlace="${JSON.stringify(raw.birthPlace)}" nationality="${JSON.stringify(raw.nationality)}" → resolved="${countryRaw}"`);
+
   const profile = {
     id:          String(raw.id || espnId),
     displayName: raw.displayName || raw.fullName || null,
-    // Country: ESPN uses "citizenship" (string) or nested nationality object
-    country:     raw.citizenship
-                 || (typeof raw.nationality === "object" ? raw.nationality?.displayName : raw.nationality)
-                 || null,
-    // Hand: { type, displayValue } → "Right" / "Left"
+    country:     countryRaw,
     hand:        (typeof raw.hand === "object" ? raw.hand?.displayValue : raw.hand) || null,
-    // Age as integer
     age:         raw.age != null ? Number(raw.age) : null,
-    // Height in inches → convert to cm for display
     heightIn:    raw.height ? Number(raw.height) : null,
-    // Active status
     active:      raw.active === true,
-    // Professional status (distinguishes from juniors)
     professional: raw.professional !== false,
   };
 
-  // Only cache when we got at least a name — guard against malformed responses
   if (profile.displayName) {
     profileCache.set(cacheKey, { data: profile, at: Date.now() });
-    console.log(`[athlete] Cached ${league}/${espnId}: ${profile.displayName}, ${profile.country}, hand=${profile.hand}, age=${profile.age}`);
+    console.log(`[athlete] Cached ${league}/${espnId}: ${profile.displayName}, country=${profile.country}, hand=${profile.hand}, age=${profile.age}`);
   }
   return { profile, cached: false };
 }
+
+// ─── /api/athlete-raw — returns the FULL raw ESPN athlete payload for debugging ─
+// Use this to inspect exactly what fields ESPN returns for a given athlete ID.
+// Call /api/rankings first to warm the cache and get espnIds from singles[N].espnId
+app.get("/api/athlete-raw", async (req, res) => {
+  const tour   = String(req.query?.tour || "atp").toLowerCase() === "wta" ? "wta" : "atp";
+  const espnId = String(req.query?.id || "").trim();
+  if (!espnId || !/^\d+$/.test(espnId)) {
+    return res.status(400).json({ error: "id parameter required (numeric ESPN athlete ID)" });
+  }
+  try {
+    const url  = ESPN_CORE_ATHLETE(tour, espnId);
+    const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!resp.ok) return res.status(502).json({ tour, espnId, url, error: `HTTP ${resp.status}` });
+    const raw = await resp.json();
+    // Return the full raw payload with a key listing at the top
+    return res.json({ tour, espnId, url, topLevelKeys: Object.keys(raw), raw });
+  } catch(e) { return res.status(500).json({ tour, espnId, error: String(e) }); }
+});
 
 function parseRankingsResponse(raw, tour) {
   const list = Array.isArray(raw?.rankings) ? raw.rankings : [];
@@ -790,8 +820,17 @@ app.get("/api/tournaments", async (_req, res) => {
 app.get("/api/athlete", async (req, res) => {
   const tour    = String(req.query?.tour || "atp").toLowerCase() === "wta" ? "wta" : "atp";
   const espnId  = String(req.query?.id || "").trim();
+  const noCache = req.query?.nocache === "1";
   if (!espnId || !/^\d+$/.test(espnId)) {
     return res.status(400).json({ error: "id parameter required (numeric ESPN athlete ID)" });
+  }
+  // Allow caller to bust the cache when a profile had missing fields (e.g. country=null)
+  if (noCache) {
+    const cacheKey = `${tour}:${espnId}`;
+    if (profileCache.has(cacheKey)) {
+      console.log(`[athlete] Cache bust for ${cacheKey}`);
+      profileCache.delete(cacheKey);
+    }
   }
   try {
     const result = await fetchAthleteProfile(tour, espnId);
@@ -945,6 +984,7 @@ app.listen(PORT, () => {
   console.log(`  GET /api/tournaments         — tournaments with dates + status`);
   console.log(`  GET /api/rankings?tour=      — top 150 singles rankings (cached 6h)`);
   console.log(`  GET /api/athlete?tour=&id=   — player profile by ESPN ID (cached 24h)`);
+  console.log(`  GET /api/athlete-raw?tour=&id= — FULL raw ESPN athlete payload (debug)`);
   console.log(`  GET /api/rankings/debug?tour= — raw ESPN rankings shape`);
   console.log(`  GET /api/athlete/debug?tour=  — test athlete fetch with ranked IDs`);
   console.log(`  GET /api/atp                 — ATP only (legacy)`);
