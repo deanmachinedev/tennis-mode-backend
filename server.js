@@ -40,16 +40,25 @@ function fmtDateRange(start, end, derived) {
 }
 
 // ─── RANKINGS CACHE ───────────────────────────────────────────────────────────
-// ESPN rankings endpoint returns singles and doubles categories in one response.
+// ESPN's public tennis rankings endpoints (site.web.api.espn.com) return singles
+// rankings only. The GitHub/public ESPN API docs confirm no doubles category exists
+// in the rankings response. The sports.core.api.espn.com endpoints return HTTP 403
+// from server environments (IP-restricted to ESPN CDN/approved origins).
+//
+// Summary of available endpoints:
+//   site.web.api.espn.com/rankings → singles only, ATP + WTA, confirmed working
+//   sports.core.api.espn.com       → 403 from server IP, cannot use
+//   Doubles rankings               → NOT available in any accessible public endpoint
+//
 // Cache: 6 hours (rankings update weekly).
-// IMPORTANT: only cache when singles has real rows — never cache null/null.
-const RANKINGS_TTL_MS = 6 * 60 * 60 * 1000;
+// Only cached when singles has real rows — never cache null/null failures.
+const RANKINGS_TTL_MS    = 6 * 60 * 60 * 1000;
+const ESPN_DOUBLES_AVAILABLE = false;  // confirmed absent from ESPN public endpoint
 const rankingsCache = {
-  atp: null, atpAt: 0,   // { singles: [...], doubles: [...] | null }
+  atp: null, atpAt: 0,
   wta: null, wtaAt: 0,
 };
 
-// Correct ESPN rankings URLs (confirmed working)
 const ESPN_ATP_RANKINGS = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/atp/rankings?region=us&lang=en";
 const ESPN_WTA_RANKINGS = "https://site.web.api.espn.com/apis/site/v2/sports/tennis/wta/rankings?region=us&lang=en";
 
@@ -75,36 +84,99 @@ function parseRankingsList(entry) {
     rank:   r?.current ?? r?.rank ?? (idx + 1),
     name:   r?.athlete?.displayName || r?.athlete?.fullName || r?.displayName || "Unknown",
     points: r?.points ?? r?.rankingPoints ?? null,
+    // Extract ESPN athlete ID from the embedded athlete object.
+    // This allows the frontend to request a profile without needing the athletes list endpoint.
+    espnId: r?.athlete?.id ? String(r.athlete.id) : null,
   })).filter(r => r.name !== "Unknown");
-  // Limit to top 150 — do not show more than 150 players in any rankings list
   return list.length > 0 ? list.slice(0, 150) : null;
+}
+
+// ─── ATHLETE PROFILE CACHE ────────────────────────────────────────────────────
+// Individual profiles are fetched on demand by espnId (extracted from rankings).
+// Cache: 24 hours — profiles change rarely (country, hand, age are stable).
+// Never caches a null/failed result.
+const PROFILE_TTL_MS  = 24 * 60 * 60 * 1000;
+const profileCache    = new Map();   // espnId → { data, at }
+
+const ESPN_CORE_ATHLETE = (league, id) =>
+  `https://sports.core.api.espn.com/v2/sports/tennis/leagues/${league}/athletes/${id}`;
+
+async function fetchAthleteProfile(league, espnId) {
+  const cacheKey = `${league}:${espnId}`;
+  const cached   = profileCache.get(cacheKey);
+  if (cached && (Date.now() - cached.at) < PROFILE_TTL_MS) {
+    return { profile: cached.data, cached: true };
+  }
+
+  const url  = ESPN_CORE_ATHLETE(league, espnId);
+  console.log(`[athlete] Fetching ${league}/${espnId}: ${url}`);
+  const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!resp.ok) {
+    console.error(`[athlete] HTTP ${resp.status} for ${url}`);
+    throw new Error(`ESPN athlete HTTP ${resp.status}`);
+  }
+  const raw = await resp.json();
+
+  // Extract only the fields we know are reliably present
+  const profile = {
+    id:          String(raw.id || espnId),
+    displayName: raw.displayName || raw.fullName || null,
+    // Country: ESPN uses "citizenship" (string) or nested nationality object
+    country:     raw.citizenship
+                 || (typeof raw.nationality === "object" ? raw.nationality?.displayName : raw.nationality)
+                 || null,
+    // Hand: { type, displayValue } → "Right" / "Left"
+    hand:        (typeof raw.hand === "object" ? raw.hand?.displayValue : raw.hand) || null,
+    // Age as integer
+    age:         raw.age != null ? Number(raw.age) : null,
+    // Height in inches → convert to cm for display
+    heightIn:    raw.height ? Number(raw.height) : null,
+    // Active status
+    active:      raw.active === true,
+    // Professional status (distinguishes from juniors)
+    professional: raw.professional !== false,
+  };
+
+  // Only cache when we got at least a name — guard against malformed responses
+  if (profile.displayName) {
+    profileCache.set(cacheKey, { data: profile, at: Date.now() });
+    console.log(`[athlete] Cached ${league}/${espnId}: ${profile.displayName}, ${profile.country}, hand=${profile.hand}, age=${profile.age}`);
+  }
+  return { profile, cached: false };
 }
 
 function parseRankingsResponse(raw, tour) {
   const list = Array.isArray(raw?.rankings) ? raw.rankings : [];
   const categoryNames = list.map(r => r?.name || "(unnamed)");
-  console.log(`[rankings] ${tour} categories found: [${categoryNames.join(", ")}]  total categories: ${list.length}`);
-  // Log first entry shape for debugging WTA differences
+  console.log(`[rankings] ${tour} categories found: [${categoryNames.join(", ")}]  total: ${list.length}`);
   if (list[0]) {
     const firstRanksLen = Array.isArray(list[0].ranks) ? list[0].ranks.length : "not-array";
     console.log(`[rankings] ${tour} first category: name="${list[0].name}" ranks=${firstRanksLen}`);
     if (Array.isArray(list[0].ranks) && list[0].ranks[0]) {
-      const sample = list[0].ranks[0];
-      console.log(`[rankings] ${tour} sample rank[0]: current=${sample.current} points=${sample.points} athlete="${sample.athlete?.displayName}"`);
+      const s = list[0].ranks[0];
+      console.log(`[rankings] ${tour} sample rank[0]: current=${s.current} points=${s.points} athlete="${s.athlete?.displayName}"`);
     }
   }
 
-  // Doubles: any entry whose name contains "doubles" (case-insensitive)
-  const doublesEntry = list.find(r => (r?.name || "").toLowerCase().includes("doubles"));
+  // ESPN public rankings endpoint only provides singles (confirmed via docs + live testing).
+  // No doubles category is available. Set doubles=null immediately — do not search for it.
+  // If ESPN ever adds doubles, it will appear as a category with "doubles" in the name
+  // and this code will need to be updated. Log a warning if we see an unexpected category.
+  const unexpectedCategories = list.filter(r => {
+    const n = (r?.name || "").toLowerCase();
+    return !n.includes(tour.toLowerCase()) && n !== "" && !n.includes("singles");
+  });
+  if (unexpectedCategories.length > 0) {
+    console.log(`[rankings] ${tour} UNEXPECTED categories (possible doubles?): ${unexpectedCategories.map(r=>r.name).join(", ")}`);
+  }
 
-  // Singles: first entry that is NOT the doubles entry AND has at least one rank.
-  // Works for "ATP" (confirmed), "WTA", "ATP Singles", "WTA Singles", etc.
-  const singlesEntry = list.find(r => r !== doublesEntry && Array.isArray(r?.ranks) && r.ranks.length > 0);
-
+  // Singles: first category with ranks (only category ESPN provides for tennis rankings)
+  const singlesEntry = list.find(r => Array.isArray(r?.ranks) && r.ranks.length > 0);
   const singles = parseRankingsList(singlesEntry);
-  const doubles = parseRankingsList(doublesEntry);
+  // Doubles: null — not available from ESPN's public endpoint
+  const doubles = null;
 
-  console.log(`[rankings] ${tour} parsed: singles=${singles?.length ?? "null"} doubles=${doubles?.length ?? "null"}`);
+  console.log(`[rankings] ${tour} parsed: singles=${singles?.length ?? "null"} doubles=null (ESPN does not provide)`);
   return { singles, doubles };
 }
 
@@ -710,7 +782,52 @@ app.get("/api/tournaments", async (_req, res) => {
   }
 });
 
-// ─── /api/rankings/debug — raw ESPN rankings response for schema inspection ───
+// ─── /api/athlete — individual player profile by ESPN athlete ID ───────────────
+// espnId is extracted from the rankings response (ranks[i].athlete.id).
+// tour param determines which league path to use (atp | wta).
+// Returns real ESPN athlete data: country, hand, age, height, active.
+// Missing fields are omitted (null) — never fabricated.
+app.get("/api/athlete", async (req, res) => {
+  const tour    = String(req.query?.tour || "atp").toLowerCase() === "wta" ? "wta" : "atp";
+  const espnId  = String(req.query?.id || "").trim();
+  if (!espnId || !/^\d+$/.test(espnId)) {
+    return res.status(400).json({ error: "id parameter required (numeric ESPN athlete ID)" });
+  }
+  try {
+    const result = await fetchAthleteProfile(tour, espnId);
+    return res.json({ tour, espnId, fromCache: result.cached, ...result.profile });
+  } catch (error) {
+    console.error(`[athlete] ${tour}/${espnId} failed: ${String(error)}`);
+    return res.status(502).json({ tour, espnId, error: String(error) });
+  }
+});
+
+// ─── /api/athlete/debug — verify athlete endpoint and fields ──────────────────
+// Takes the first espnId from the already-cached rankings to test the athlete fetch.
+// Use this to confirm what fields are actually available before building the UI.
+app.get("/api/athlete/debug", async (req, res) => {
+  const tour = String(req.query?.tour || "atp").toLowerCase() === "wta" ? "wta" : "atp";
+  const key  = tour === "wta" ? "wta" : "atp";
+  const cached = rankingsCache[key];
+  if (!cached?.singles?.length) {
+    return res.status(503).json({ error: "Rankings not yet loaded — call /api/rankings first" });
+  }
+  // Use first 3 ranked players to test profile fetch
+  const samples = cached.singles.slice(0, 3).filter(r => r.espnId);
+  if (!samples.length) {
+    return res.status(503).json({ error: "No espnIds in cached rankings — rankings may need refresh" });
+  }
+  const results = await Promise.allSettled(
+    samples.map(r => fetchAthleteProfile(tour, r.espnId).then(p => ({ name: r.name, rank: r.rank, ...p.profile })))
+  );
+  return res.json({
+    tour,
+    tested: samples.length,
+    profiles: results.map((r, i) => r.status === "fulfilled"
+      ? r.value
+      : { name: samples[i].name, error: String(r.reason) }),
+  });
+});
 // Use this to diagnose WTA/doubles parsing: open in browser to see exact shape.
 app.get("/api/rankings/debug", async (req, res) => {
   const tour = String(req.query?.tour || "atp").toUpperCase() === "WTA" ? "WTA" : "ATP";
@@ -824,10 +941,12 @@ app.get("/api/debug", async (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Tennis Mode backend running on port ${PORT}`);
-  console.log(`  GET /api/tennis             — ATP + WTA combined (today + yesterday)`);
-  console.log(`  GET /api/tournaments        — unique tournaments with dates + status`);
-  console.log(`  GET /api/rankings?tour=     — ATP or WTA top 150 rankings (cached 6h)`);
-  console.log(`  GET /api/rankings/debug?tour= — raw ESPN rankings shape (for debugging)`);
-  console.log(`  GET /api/atp                — ATP only (legacy)`);
-  console.log(`  GET /api/debug?tour=        — raw ESPN scoreboard schema`);
+  console.log(`  GET /api/tennis              — ATP + WTA scores (today + yesterday)`);
+  console.log(`  GET /api/tournaments         — tournaments with dates + status`);
+  console.log(`  GET /api/rankings?tour=      — top 150 singles rankings (cached 6h)`);
+  console.log(`  GET /api/athlete?tour=&id=   — player profile by ESPN ID (cached 24h)`);
+  console.log(`  GET /api/rankings/debug?tour= — raw ESPN rankings shape`);
+  console.log(`  GET /api/athlete/debug?tour=  — test athlete fetch with ranked IDs`);
+  console.log(`  GET /api/atp                 — ATP only (legacy)`);
+  console.log(`  GET /api/debug?tour=         — raw ESPN scoreboard schema`);
 });
