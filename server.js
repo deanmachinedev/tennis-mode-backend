@@ -8,6 +8,30 @@ const PORT = process.env.PORT || 3000;
 const ESPN_ATP_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard";
 const ESPN_WTA_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard";
 
+// Build date string YYYYMMDD for ESPN's ?dates= query param
+function espnDate(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toISOString().slice(0, 10).replace(/-/g, "");
+}
+
+// Fetch one ESPN endpoint with an optional date override
+async function fetchTourUrl(url) {
+  const resp = await fetch(url, { signal: AbortSignal.timeout(25000) });
+  if (!resp.ok) throw new Error(`ESPN fetch failed: ${resp.status} for ${url}`);
+  const raw = await resp.json();
+  const events = Array.isArray(raw?.events) ? raw.events : [];
+  return events.flatMap((event) => {
+    const groupings = Array.isArray(event?.groupings) ? event.groupings : [];
+    return groupings.flatMap((grouping) => {
+      const competitions = Array.isArray(grouping?.competitions) ? grouping.competitions : [];
+      return competitions
+        .map((comp) => normalizeCompetition(event, grouping, comp))
+        .filter((m) => m !== null);
+    });
+  });
+}
+
 app.use(cors());
 
 app.get("/", (_req, res) => {
@@ -371,26 +395,6 @@ function normalizeCompetition(event, grouping, competition) {
   };
 }
 
-// ─── FETCH ONE TOUR ───────────────────────────────────────────────────────────
-// Fetches one ESPN endpoint and normalizes all competitions.
-// Tour/discipline are derived from competition metadata, not the URL.
-// Competitions that cannot be classified are silently skipped (null filter).
-async function fetchTour(url) {
-  const resp = await fetch(url, { signal: AbortSignal.timeout(25000) });
-  if (!resp.ok) throw new Error(`ESPN fetch failed: ${resp.status} for ${url}`);
-  const raw = await resp.json();
-  const events = Array.isArray(raw?.events) ? raw.events : [];
-  return events.flatMap((event) => {
-    const groupings = Array.isArray(event?.groupings) ? event.groupings : [];
-    return groupings.flatMap((grouping) => {
-      const competitions = Array.isArray(grouping?.competitions) ? grouping.competitions : [];
-      return competitions
-        .map((comp) => normalizeCompetition(event, grouping, comp))
-        .filter((m) => m !== null);  // drop unclassifiable competitions
-    });
-  });
-}
-
 // ─── SORT HELPERS ─────────────────────────────────────────────────────────────
 // Canonical priority order: live first, then scheduled (chronological), then final/other
 const STATUS_PRIORITY = { live: 0, scheduled: 1, final: 2, retired: 3, walkover: 3, postponed: 4, suspended: 4, cancelled: 5, unknown: 6 };
@@ -410,15 +414,35 @@ function sortMatches(matches) {
   });
 }
 
+// ─── FETCH WITH DATE RANGE ────────────────────────────────────────────────────
+// ESPN scoreboard supports ?dates=YYYYMMDD for historical results.
+// We fetch today + yesterday for both tours in parallel (4 requests total).
+// All results are merged and deduplicated by competition id.
+// This ensures yesterday's finals and recently completed matches are visible.
+async function fetchAllDates(baseUrl) {
+  const today     = espnDate(0);
+  const yesterday = espnDate(-1);
+  const [resT, resY] = await Promise.allSettled([
+    fetchTourUrl(`${baseUrl}?dates=${today}`),
+    fetchTourUrl(`${baseUrl}?dates=${yesterday}`),
+  ]);
+  const combined = [
+    ...(resT.status === "fulfilled" ? resT.value : []),
+    ...(resY.status === "fulfilled" ? resY.value : []),
+  ];
+  // Deduplicate by id within this tour's results
+  const seen = new Set();
+  return combined.filter((m) => { if (seen.has(m.id)) return false; seen.add(m.id); return true; });
+}
+
 // ─── /api/tennis — primary endpoint ──────────────────────────────────────────
 app.get("/api/tennis", async (_req, res) => {
   try {
-    // Fetch both endpoints in parallel. Tour/discipline come from metadata, not URL.
-    // We fetch both URLs to maximise coverage — some tournaments appear on both.
-    // Deduplication by competition.id prevents double-counting.
+    // Fetch ATP and WTA for today + yesterday in parallel (4 total requests).
+    // Yesterday's date ensures finals from completed tournaments are included.
     const [atpResult, wtaResult] = await Promise.allSettled([
-      fetchTour(ESPN_ATP_URL),
-      fetchTour(ESPN_WTA_URL),
+      fetchAllDates(ESPN_ATP_URL),
+      fetchAllDates(ESPN_WTA_URL),
     ]);
 
     const atpRaw = atpResult.status === "fulfilled" ? atpResult.value : [];
@@ -426,21 +450,38 @@ app.get("/api/tennis", async (_req, res) => {
     const atpErr = atpResult.status === "rejected" ? String(atpResult.reason) : null;
     const wtaErr = wtaResult.status === "rejected" ? String(wtaResult.reason) : null;
 
-    // Merge and deduplicate by competition id
+    // Global dedup across ATP + WTA payloads by competition id
     const seen = new Set();
     const all = [];
     for (const m of [...atpRaw, ...wtaRaw]) {
       if (!seen.has(m.id)) { seen.add(m.id); all.push(m); }
     }
 
-    // Split into 4 buckets using tour+discipline fields derived from metadata
-    const atpSingles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "singles"));
-    const atpDoubles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "doubles"));
-    const wtaSingles = sortMatches(all.filter((m) => m.tour === "WTA" && m.discipline === "singles"));
-    const wtaDoubles = sortMatches(all.filter((m) => m.tour === "WTA" && m.discipline === "doubles"));
+    // Split into 4 buckets. Within each bucket sort by:
+    //   1. Status priority (live → scheduled → final → other)
+    //   2. Tournament name alphabetically (groups same tournament together)
+    //   3. Scheduled time for scheduled matches
+    const tournSort = (a, b) => {
+      const ta = (a.tournament || "").toLowerCase();
+      const tb = (b.tournament || "").toLowerCase();
+      return ta < tb ? -1 : ta > tb ? 1 : 0;
+    };
+    const fullSort = (matches) => sortMatches(matches).sort((a, b) => {
+      // Only group by tournament within the same status bucket
+      const pa = STATUS_PRIORITY[a.statusNorm] ?? 6;
+      const pb = STATUS_PRIORITY[b.statusNorm] ?? 6;
+      if (pa !== pb) return pa - pb;
+      return tournSort(a, b);
+    });
+
+    const atpSingles = fullSort(all.filter((m) => m.tour === "ATP" && m.discipline === "singles"));
+    const atpDoubles = fullSort(all.filter((m) => m.tour === "ATP" && m.discipline === "doubles"));
+    const wtaSingles = fullSort(all.filter((m) => m.tour === "WTA" && m.discipline === "singles"));
+    const wtaDoubles = fullSort(all.filter((m) => m.tour === "WTA" && m.discipline === "doubles"));
 
     return res.json({
       updatedAt: new Date().toISOString(),
+      dates: { today: espnDate(0), yesterday: espnDate(-1) },
       errors: { atp: atpErr, wta: wtaErr },
       counts: {
         atpSingles: atpSingles.length,
@@ -458,10 +499,44 @@ app.get("/api/tennis", async (_req, res) => {
   }
 });
 
+// ─── /api/tournaments — unique tournament names with status summary ────────────
+app.get("/api/tournaments", async (_req, res) => {
+  try {
+    const [atpResult, wtaResult] = await Promise.allSettled([
+      fetchAllDates(ESPN_ATP_URL),
+      fetchAllDates(ESPN_WTA_URL),
+    ]);
+    const all = [
+      ...(atpResult.status === "fulfilled" ? atpResult.value : []),
+      ...(wtaResult.status === "fulfilled" ? wtaResult.value : []),
+    ];
+    // Collect unique tournaments with counts per status
+    const map = new Map();
+    for (const m of all) {
+      const key = `${m.tour}::${m.tournament}`;
+      if (!map.has(key)) {
+        map.set(key, { tour: m.tour, name: m.tournament, live: 0, final: 0, scheduled: 0 });
+      }
+      const t = map.get(key);
+      if (m.statusNorm === "live") t.live++;
+      else if (["final","retired","walkover"].includes(m.statusNorm)) t.final++;
+      else if (m.statusNorm === "scheduled") t.scheduled++;
+    }
+    const tournaments = [...map.values()].sort((a, b) => {
+      // Active (live) tournaments first, then completed, then scheduled
+      const score = t => (t.live > 0 ? 0 : t.scheduled > 0 ? 1 : 2);
+      return score(a) - score(b) || a.name.localeCompare(b.name);
+    });
+    return res.json({ updatedAt: new Date().toISOString(), tournaments });
+  } catch (error) {
+    return res.status(500).json({ error: String(error) });
+  }
+});
+
 // ─── /api/atp — legacy compatibility ─────────────────────────────────────────
 app.get("/api/atp", async (_req, res) => {
   try {
-    const all = await fetchTour(ESPN_ATP_URL);
+    const all = await fetchTourUrl(ESPN_ATP_URL);
     const singles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "singles"));
     const doubles = sortMatches(all.filter((m) => m.tour === "ATP" && m.discipline === "doubles"));
     return res.json({
@@ -480,7 +555,7 @@ app.get("/api/debug", async (_req, res) => {
   try {
     const tour = (String(res.req?.query?.tour || "atp")).toLowerCase() === "wta" ? "WTA" : "ATP";
     const url = tour === "WTA" ? ESPN_WTA_URL : ESPN_ATP_URL;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    const resp = await fetch(`${url}?dates=${espnDate(0)}`, { signal: AbortSignal.timeout(15000) });
     if (!resp.ok) return res.status(502).json({ error: `ESPN ${resp.status}` });
     const raw = await resp.json();
     const firstEvent = Array.isArray(raw?.events) ? raw.events[0] : null;
@@ -488,6 +563,7 @@ app.get("/api/debug", async (_req, res) => {
     const firstComp = firstGrouping?.competitions?.[0] || null;
     return res.json({
       tour,
+      date: espnDate(0),
       firstEventName: firstEvent?.name,
       firstEventStatus: firstEvent?.status?.type,
       firstGroupingName: firstGrouping?.grouping,
@@ -502,7 +578,8 @@ app.get("/api/debug", async (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Tennis Mode backend running on port ${PORT}`);
-  console.log(`  GET /api/tennis  — ATP + WTA combined`);
-  console.log(`  GET /api/atp     — ATP only (legacy)`);
+  console.log(`  GET /api/tennis      — ATP + WTA combined (today + yesterday)`);
+  console.log(`  GET /api/tournaments — unique tournaments with status summary`);
+  console.log(`  GET /api/atp         — ATP only (legacy)`);
   console.log(`  GET /api/debug?tour=atp|wta — raw ESPN schema`);
 });
