@@ -116,54 +116,51 @@ async function fetchAthleteProfile(league, espnId) {
     throw new Error(`ESPN athlete HTTP ${resp.status}`);
   }
   const raw = await resp.json();
-
-  // Log ALL top-level keys so we can see the real shape without guessing
   console.log(`[athlete] ${league}/${espnId} top-level keys: ${Object.keys(raw).join(", ")}`);
 
   // ── Birthplace ───────────────────────────────────────────────────────────────
-  // ESPN returns this field as lowercase "birthplace" (NOT "birthPlace" camelCase).
-  // Shape observed: { city: "San Candido", country: { description: "Italy" } }
-  // We support both casings defensively.
-  const bp        = raw.birthplace ?? raw.birthPlace ?? null;
-  // birthplace.country may be: { description: "Italy" } | { displayName: "Italy" } | "Italy" | null
-  const bpCountry = bp
-    ? (typeof bp.country === "string" ? bp.country
-        : bp.country?.description ?? bp.country?.displayName ?? bp.country?.name ?? null)
-    : null;
-  // birthplace city/state string — used only for "Born:" display, never as country fallback
-  const bpCity    = bp
-    ? (bp.city ?? bp.displayName ?? (typeof bp === "string" ? bp : null))
-    : null;
-  // Full birthplace string e.g. "San Candido, Italy" — only built when we have real subfields
-  const birthplaceStr = bpCity
-    ? (bpCountry ? `${bpCity}, ${bpCountry}` : bpCity)
-    : (bpCountry ?? null);
+  // ESPN returns "birthPlace": { "summary": "San Candido, Italy" }
+  // The summary is a plain string — there is no nested country object for this athlete.
+  // Support both casings (confirmed camelCase "birthPlace" in Sinner's payload).
+  const bpRaw     = raw.birthPlace ?? raw.birthplace ?? null;
+  const bpSummary = (typeof bpRaw === "string" ? bpRaw
+                   : bpRaw?.summary ?? bpRaw?.displayName ?? bpRaw?.city ?? null);
 
-  console.log(`[athlete] ${league}/${espnId} birthplace raw: ${JSON.stringify(bp)} → city="${bpCity}" country="${bpCountry}"`);
+  // Derive country from the last segment after the final comma.
+  // "San Candido, Italy" → "Italy"
+  // "New York, NY, USA" → "USA"
+  // "Monaco"            → null (no comma → can't safely split off a country)
+  // Only derive when there are at least 2 comma-separated parts and the last
+  // part is 2–30 chars (filters out bare city names being misread as countries).
+  let derivedCountry = null;
+  if (bpSummary && bpSummary.includes(",")) {
+    const parts = bpSummary.split(",").map(s => s.trim()).filter(Boolean);
+    const last  = parts[parts.length - 1];
+    if (last && last.length >= 2 && last.length <= 30) {
+      derivedCountry = last;
+    }
+  }
+  console.log(`[athlete] ${league}/${espnId} birthPlace summary="${bpSummary}" → derivedCountry="${derivedCountry}"`);
 
   // ── Country resolution ───────────────────────────────────────────────────────
-  // Priority: direct fields first, then country extracted from birthplace.
-  // We DO NOT guess country from city name alone.
+  // Direct ESPN fields first, then fall back to what we derived from birthPlace.summary.
   const countryRaw = (
-    raw.citizenship                                                 // string "Italy"
-    ?? raw.citizenshipCountry?.displayName                          // nested object
-    ?? raw.citizenshipCountry?.name
+    raw.citizenship
+    ?? raw.citizenshipCountry?.displayName ?? raw.citizenshipCountry?.name
     ?? (typeof raw.nationality === "string" ? raw.nationality : null)
-    ?? raw.nationality?.displayName
-    ?? raw.nationality?.name
+    ?? raw.nationality?.displayName ?? raw.nationality?.name
     ?? (typeof raw.country === "string" ? raw.country : null)
-    ?? raw.country?.description
-    ?? raw.country?.displayName
-    ?? bpCountry                                                    // from birthplace.country
+    ?? raw.country?.description ?? raw.country?.displayName
+    ?? derivedCountry
     ?? null
   );
-  console.log(`[athlete] ${league}/${espnId} country resolved: "${countryRaw}"`);
+  console.log(`[athlete] ${league}/${espnId} country resolved="${countryRaw}"`);
 
   const profile = {
     id:          String(raw.id || espnId),
     displayName: raw.displayName || raw.fullName || null,
     country:     countryRaw,
-    birthplace:  birthplaceStr,          // "San Candido, Italy" or just "San Candido" or null
+    birthPlace:  bpSummary || null,          // "San Candido, Italy" full summary string
     hand:        (typeof raw.hand === "object" ? raw.hand?.displayValue : raw.hand) || null,
     age:         raw.age != null ? Number(raw.age) : null,
     heightIn:    raw.height ? Number(raw.height) : null,
