@@ -229,8 +229,11 @@ function parseRankingsResponse(raw, tour) {
   return { singles, doubles };
 }
 
-async function fetchRankings(tour) {
-  const isWta  = tour === "WTA";
+async function fetchRankings(tourOrBool) {
+  // Accept either a string ("ATP"/"WTA") or a boolean (true=WTA, false=ATP)
+  // so all call sites work regardless of how they pass the argument.
+  const isWta  = tourOrBool === true || String(tourOrBool).toUpperCase() === "WTA";
+  const tour   = isWta ? "WTA" : "ATP";
   const now    = Date.now();
   const key    = isWta ? "wta" : "atp";
   const atKey  = isWta ? "wtaAt" : "atpAt";
