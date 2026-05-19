@@ -81,12 +81,11 @@ function parseRankingsList(entry) {
   const ranks = Array.isArray(entry.ranks) ? entry.ranks : [];
   if (ranks.length === 0) return null;
   const list = ranks.map((r, idx) => ({
-    rank:   r?.current ?? r?.rank ?? (idx + 1),
-    name:   r?.athlete?.displayName || r?.athlete?.fullName || r?.displayName || "Unknown",
-    points: r?.points ?? r?.rankingPoints ?? null,
-    // Extract ESPN athlete ID from the embedded athlete object.
-    // This allows the frontend to request a profile without needing the athletes list endpoint.
-    espnId: r?.athlete?.id ? String(r.athlete.id) : null,
+    rank:     r?.current ?? r?.rank ?? (idx + 1),
+    previous: r?.previous ?? null,   // previous rank — ESPN provides this; null if missing
+    name:     r?.athlete?.displayName || r?.athlete?.fullName || r?.displayName || "Unknown",
+    points:   r?.points ?? r?.rankingPoints ?? null,
+    espnId:   r?.athlete?.id ? String(r.athlete.id) : null,
   })).filter(r => r.name !== "Unknown");
   return list.length > 0 ? list.slice(0, 150) : null;
 }
@@ -209,7 +208,7 @@ function parseRankingsResponse(raw, tour) {
     console.log(`[rankings] ${tour} first category: name="${list[0].name}" ranks=${firstRanksLen}`);
     if (Array.isArray(list[0].ranks) && list[0].ranks[0]) {
       const s = list[0].ranks[0];
-      console.log(`[rankings] ${tour} sample rank[0]: current=${s.current} points=${s.points} athlete="${s.athlete?.displayName}"`);
+      console.log(`[rankings] ${tour} sample rank[0]: current=${s.current} previous=${s.previous} points=${s.points} athlete="${s.athlete?.displayName}"`);
     }
   }
 
