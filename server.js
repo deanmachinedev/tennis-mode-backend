@@ -166,6 +166,12 @@ async function fetchAthleteProfile(league, espnId) {
     heightIn:    raw.height ? Number(raw.height) : null,
     active:      raw.active === true,
     professional: raw.professional !== false,
+    // Headshot: prefer ESPN athlete API field, fall back to deterministic CDN pattern.
+    // Both resolve to the same URL in practice for ranked players.
+    // Format: https://a.espncdn.com/i/headshots/tennis/players/full/{id}.png
+    // Returns 200 PNG for players with photos, 404 for others — graceful fallback.
+    headshotUrl: raw.headshot?.href
+      || `https://a.espncdn.com/i/headshots/tennis/players/full/${String(raw.id || espnId)}.png`,
   };
 
   if (profile.displayName) {
@@ -346,38 +352,46 @@ function normalizeStatus(statusObj) {
   // eslint-disable-next-line eqeqeq
   const completed = type.completed === true || type.completed == "true";
 
+  // Consolidated suspension/delay detector — all ESPN variants in one place.
+  // Use word-boundary checks (/\bword/) to avoid false positives from JSON field names
+  // like "wasSuspended" appearing in serialized text. ESPN's actual status text fields
+  // (description/detail/name) use clean words: "Suspended", "Rain Delay", "Weather Delay".
+  const _hasSuspend  = /\bsuspend/i;
+  const _hasRain     = /\brain\b/i;
+  const _hasWeather  = /\bweather\b/i;
+  const _hasDelay    = /\bdelay\b/i;
+  const _hasInterrupt= /\binterrupt/i;
+  const _matchAny    = (s) => _hasSuspend.test(s) || _hasRain.test(s) || _hasWeather.test(s) || _hasDelay.test(s) || _hasInterrupt.test(s);
+  const isSuspended = _matchAny(desc) || _matchAny(detail) || _matchAny(name);
+
   // ── 1. completed:true always wins — even if state:"in" is stale ──────────────
-  // This is the tiebreak-match fix: ESPN sometimes serves state:"in" for a match
-  // that completed during a tiebreak because the scoreboard data is stale.
   // completed:true is set server-side and is more reliable than state.
+  // A suspended match has completed:false — this branch never fires for them.
   if (completed) {
     if (desc.includes("retired")  || detail.includes("retired"))  return "retired";
     if (desc.includes("walkover") || detail.includes("walkover") || desc.includes("w/o")) return "walkover";
     if (desc.includes("postponed") || detail.includes("postponed")) return "postponed";
     if (desc.includes("cancelled") || detail.includes("cancelled")) return "cancelled";
-    // Any completed match not matching the above is "final" — including tiebreaks
     return "final";
   }
 
-  // ── 2. state:"post" — match is over ──────────────────────────────────────────
+  // ── 2. state:"post" — match is over OR suspended for the day ──────────────────
+  // KEY FIX: ESPN sometimes sets state="post" for matches suspended end-of-day
+  // (e.g. rain delay pushing to tomorrow). Without the isSuspended check these
+  // matched returned "final" and disappeared from the LIVE tab.
+  // Check suspension BEFORE defaulting to "final".
   if (state === "post") {
     if (desc.includes("retired")  || detail.includes("retired"))  return "retired";
     if (desc.includes("walkover") || detail.includes("walkover") || desc.includes("w/o")) return "walkover";
     if (desc.includes("postponed") || detail.includes("postponed")) return "postponed";
     if (desc.includes("cancelled") || detail.includes("cancelled")) return "cancelled";
-    if (desc.includes("suspended") || detail.includes("suspended")) return "suspended";
+    if (isSuspended) return "suspended";   // ← suspended-for-today: still live tomorrow
     return "final";
   }
 
   // ── 3. state:"in" — match is active, but may be suspended ───────────────────
-  // Suspended matches have state:"in" (still counted as in-progress by ESPN)
-  // but description/name/shortDetail contains suspension indicators.
   if (state === "in") {
-    if (
-      desc.includes("suspend") || detail.includes("suspend") || name.includes("suspend") ||
-      desc.includes("rain delay") || detail.includes("rain delay") || name.includes("rain") ||
-      desc.includes("delay") || name.includes("delay")
-    ) return "suspended";
+    if (isSuspended) return "suspended";
     return "live";
   }
 
@@ -385,17 +399,20 @@ function normalizeStatus(statusObj) {
   if (state === "pre") return "scheduled";
 
   // ── 5. Fallback: state field is missing or empty — infer from strings ─────────
-  // This covers ESPN edge cases where state is not populated.
-  // Check completion signals first to avoid the tiebreak false-positive:
   if (desc.includes("final") && !desc.includes("semifinal") && !desc.includes("quarterfinal")) return "final";
   if (desc.includes("retired")) return "retired";
   if (desc.includes("postponed") || detail.includes("postponed")) return "postponed";
-  if (desc.includes("suspended") || detail.includes("suspended") || name.includes("suspend")) return "suspended";
+  if (isSuspended) return "suspended";
   if (desc.includes("in progress") || desc.includes("playing")) return "live";
-  // Ordinal set indicators (e.g. shortDetail:"2nd") — only when not completed
   if (/^\d+(st|nd|rd|th)$/.test(detail.trim())) return "live";
   if (detail.includes("set") || detail.includes("tiebreak")) return "live";
   if (desc.includes("scheduled") || desc.includes("tbd")) return "scheduled";
+
+  // Log unknown statuses so we can inspect exactly what ESPN sent
+  console.warn("[normalizeStatus] unknown — raw fields:", JSON.stringify({
+    state, desc, detail, name, completed,
+    typeId: type.id, typeName: type.name
+  }));
   return "unknown";
 }
 
@@ -459,12 +476,30 @@ function classifyCompetition(grouping, competition) {
   return null;
 }
 
+// ─── LIVE STATE LABEL ────────────────────────────────────────────────────────
+// Derives a human-readable pause reason from ESPN status text fields.
+// Used for display when statusNorm === "suspended".
+function computeLiveStateLabel(desc, detail, name) {
+  for (const txt of [desc, detail, name]) {
+    const t = (txt || "").toLowerCase();
+    if (/\brain/i.test(txt))       return "RAIN DELAY";
+    if (/\bweather/i.test(txt))    return "WEATHER";
+    if (/\binterrupt/i.test(txt))  return "INTERRUPTED";
+    if (/\bmedical/i.test(txt))    return "MEDICAL";
+    if (/\bsuspend/i.test(txt))    return "SUSPENDED";
+    if (/\bdelay/i.test(txt))      return "DELAYED";
+  }
+  return "SUSPENDED";  // default for any paused-in-play match
+}
+
 // ─── MATCH NOTES ─────────────────────────────────────────────────────────────
 // ESPN provides notes arrays and situation.lastPlay for live commentary
 function extractNotes(competition) {
   const notes = [];
-  const state = (competition?.status?.type?.state || "").toLowerCase();
-  const isLive = state === "in";
+  const state     = (competition?.status?.type?.state || "").toLowerCase();
+  const desc      = (competition?.status?.type?.description || "").toLowerCase();
+  const isLive    = state === "in";
+  const isSuspLike= isLive || /\bsuspend|\brain\b|\bweather\b|\bdelay\b|\binterrupt/i.test(desc);
 
   // competition.notes array — always include
   const noteArr = Array.isArray(competition?.notes) ? competition.notes : [];
@@ -479,14 +514,14 @@ function extractNotes(competition) {
     if (lastPlay && !notes.includes(lastPlay)) notes.push(lastPlay);
   }
 
-  // status type detail as a note ONLY for live matches.
-  // For scheduled matches, detail is the start date/time, which is already
-  // present as scheduledAt and would produce a duplicate line if added here.
-  // For final/retired matches, detail just repeats "Final"/"Retired".
-  if (isLive) {
+  // status type detail as a note for live AND suspended matches.
+  // For suspended state=post, the detail often says "Suspended" — include it.
+  // Skip generic/redundant strings.
+  if (isSuspLike) {
     const detail = competition?.status?.type?.detail || "";
-    if (detail && detail.toLowerCase() !== "scheduled" && detail.toLowerCase() !== "final") {
-      if (!notes.some((n) => n.includes(detail))) notes.push(detail);
+    const skip = ["scheduled", "final", "in progress"];
+    if (detail && !skip.includes(detail.toLowerCase())) {
+      if (!notes.some((n) => n.toLowerCase().includes(detail.toLowerCase()))) notes.push(detail);
     }
   }
 
@@ -543,82 +578,71 @@ function normalizeCompetition(event, grouping, competition) {
   //
   if (statusNorm === "live" || statusNorm === "suspended") {
 
-    // Rule 1 — winner flag (most reliable, catches most cases)
-    // ESPN sets competitor.winner=true on the winning competitor when the match
-    // ends. A genuinely live match never has winner:true on any competitor.
-    const hasWinner = competitors.some((c) => c?.winner === true);
-    if (hasWinner) {
-      statusNorm = "final";
-    } else {
-
-      // Rule 2 — recent:false + sufficient linescore
-      // ESPN's top-level competition.recent is false once the match is no longer
-      // recent (i.e. settled). Combined with enough sets played and set wins, this
-      // confirms the match is done.
-      // Conditions (ALL required):
-      //   A. competition.recent === false  (ESPN confirms not recent)
-      //   B. Both competitors have ≥2 linescore entries  (≥2 sets played)
-      //   C. One competitor has ≥2 set wins  (enough sets won to close the match)
-      const isRecent  = competition?.recent === true || competition?.recent == null;
-      const linesA = Array.isArray(a?.linescores) ? a.linescores : [];
-      const linesB = Array.isArray(b?.linescores) ? b.linescores : [];
-      const hasSets = linesA.length >= 2 && linesB.length >= 2;
-
-      if (!isRecent && hasSets) {
-        const setWinsA = linesA.filter((s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)).length;
-        const setWinsB = linesB.filter((s, i) => (s?.value ?? s ?? 0) > (linesA[i]?.value ?? linesA[i] ?? 0)).length;
-        if (Math.max(setWinsA, setWinsB) >= 2) statusNorm = "final";
+    // Rule 0 — wasSuspended boolean (competition-level field, not status text)
+    // wasSuspended=true means the match WAS suspended but has since COMPLETED.
+    // Only trust the boolean value true — never infer from field name text.
+    if (competition?.wasSuspended === true) {
+      const wsHasWinner = competitors.some((c) => c?.winner === true);
+      if (wsHasWinner) {
+        statusNorm = "final";
+        console.log("[normalizeCompetition] wasSuspended=true + winner → final");
       }
+    }
 
-      // Rule 3 — tied last set + no active tiebreak situation (catches Kovacevic case)
-      // Applies when: recent:true, state:in, no winner flag, but the last set
-      // score is tied at ≥6 (i.e. a tiebreak was in progress or just finished).
-      // A LIVE tiebreak has competition.situation.server set (the server in the
-      // tiebreak is tracked). A COMPLETED tiebreak has no situation.server.
-      // Combined with recent:true and a tied-set score, this means the tiebreak
-      // just ended but ESPN hasn't updated state yet.
-      //
-      // This rule is deliberately conservative — requires ALL of:
-      //   A. Last set score is tied at ≥6 (tiebreak condition met for that set)
-      //   B. No situation.server field (no in-progress tiebreak server)
-      //   C. Both competitors have ≥2 linescore entries (not a pre-match record)
-      //   D. The set count makes sense for a completed match (one player has ≥2 set wins
-      //      counting a tiebreak set win for the tied set as belonging to whoever
-      //      leads in total sets — but we don't need to award it; just having the
-      //      other 2 sets be non-tied is sufficient)
-      //
-      // False-positive guard: a REAL live tiebreak in set 3 of a 2-1 match will
-      // have situation.server set → Rule 3 does not fire.
-      if (statusNorm === "live" && hasSets) {
-        const lastIdxA = linesA.length - 1;
-        const lastIdxB = linesB.length - 1;
-        if (lastIdxA === lastIdxB && lastIdxA >= 1) {
-          const lastA = linesA[lastIdxA]?.value ?? linesA[lastIdxA] ?? 0;
-          const lastB = linesB[lastIdxB]?.value ?? linesB[lastIdxB] ?? 0;
-          const lastSetTied = lastA === lastB && lastA >= 6;
+    if (statusNorm === "live" || statusNorm === "suspended") {
+      // Rule 1 — winner flag (most reliable signal)
+      const hasWinner = competitors.some((c) => c?.winner === true);
+      if (hasWinner) {
+        statusNorm = "final";
+      } else {
+        // Rule 1.5 — notes contain "X bt Y" completion pattern
+        // ESPN notes: "(1) Sinner bt (7) Medvedev 6-2 5-7 4-2" → match is complete.
+        // Appears even on matches that were suspended and then completed.
+        const noteTexts = Array.isArray(competition?.notes)
+          ? competition.notes.map(n => (n?.text || n?.headline || ""))
+          : [];
+        const hasNoteResult = noteTexts.some(t =>
+          /\bbt\b/i.test(t) || /\bdefeated\b/i.test(t)
+        );
+        if (hasNoteResult) {
+          statusNorm = "final";
+          console.log("[normalizeCompetition] notes contain 'bt' result → final");
+        } else {
+          // Rule 2 — recent:false + sufficient linescore
+          const isRecent  = competition?.recent === true || competition?.recent == null;
+          const linesA = Array.isArray(a?.linescores) ? a.linescores : [];
+          const linesB = Array.isArray(b?.linescores) ? b.linescores : [];
+          const hasSets = linesA.length >= 2 && linesB.length >= 2;
 
-          const hasActiveSituation = !!(
-            competition?.situation?.server ||
-            competition?.situation?.pointA != null ||
-            competition?.situation?.pointB != null
-          );
+          if (!isRecent && hasSets) {
+            const setWinsA = linesA.filter((s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)).length;
+            const setWinsB = linesB.filter((s, i) => (s?.value ?? s ?? 0) > (linesA[i]?.value ?? linesA[i] ?? 0)).length;
+            if (Math.max(setWinsA, setWinsB) >= 2) statusNorm = "final";
+          }
 
-          if (lastSetTied && !hasActiveSituation) {
-            // Count set wins from all sets EXCEPT the last (tied) one
-            const setsExceptLast = linesA.slice(0, lastIdxA);
-            const setWinsAExcl = setsExceptLast.filter(
-              (s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)
-            ).length;
-            const setWinsBExcl = setsExceptLast.filter(
-              (s, i) => (linesB[i]?.value ?? linesB[i] ?? 0) > (s?.value ?? s ?? 0)
-            ).length;
-            // Either player leads the non-tied sets — one must be ahead ≥1
-            // (in a 3-set match at 1-1 sets, the tied set IS the decider)
-            // Just require that the non-tied sets are non-zero (real match played)
-            const realMatchPlayed = setWinsAExcl + setWinsBExcl >= 1;
-
-            if (realMatchPlayed) {
-              statusNorm = "final";
+          // Rule 3 — tied last set + no active tiebreak situation
+          if (statusNorm === "live" && hasSets) {
+            const lastIdxA = linesA.length - 1;
+            const lastIdxB = linesB.length - 1;
+            if (lastIdxA === lastIdxB && lastIdxA >= 1) {
+              const lastA = linesA[lastIdxA]?.value ?? linesA[lastIdxA] ?? 0;
+              const lastB = linesB[lastIdxB]?.value ?? linesB[lastIdxB] ?? 0;
+              const lastSetTied = lastA === lastB && lastA >= 6;
+              const hasActiveSituation = !!(
+                competition?.situation?.server ||
+                competition?.situation?.pointA != null ||
+                competition?.situation?.pointB != null
+              );
+              if (lastSetTied && !hasActiveSituation) {
+                const setsExceptLast = linesA.slice(0, lastIdxA);
+                const setWinsAExcl = setsExceptLast.filter(
+                  (s, i) => (s?.value ?? s ?? 0) > (linesB[i]?.value ?? linesB[i] ?? 0)
+                ).length;
+                const setWinsBExcl = setsExceptLast.filter(
+                  (s, i) => (linesB[i]?.value ?? linesB[i] ?? 0) > (s?.value ?? s ?? 0)
+                ).length;
+                if (setWinsAExcl + setWinsBExcl >= 1) statusNorm = "final";
+              }
             }
           }
         }
@@ -626,9 +650,22 @@ function normalizeCompetition(event, grouping, competition) {
     }
   }
 
+  // ── Derived display fields ──────────────────────────────────────────────────
+  const isLiveLike = statusNorm === "live" || statusNorm === "suspended";
+  const isFinished = ["final", "retired", "walkover", "cancelled"].includes(statusNorm);
+  const _sDesc   = competition?.status?.type?.description || "";
+  const _sDetail = competition?.status?.type?.detail || competition?.status?.type?.shortDetail || "";
+  const _sName   = competition?.status?.type?.name || "";
+  const liveStateLabel = isLiveLike
+    ? (statusNorm === "live" ? "LIVE" : computeLiveStateLabel(_sDesc, _sDetail, _sName))
+    : statusNorm.toUpperCase();
+  const delayReason = statusNorm === "suspended"
+    ? ([_sDetail, _sDesc, _sName].find(s => s && !/^(in progress|final|scheduled)$/i.test(s)) || "")
+    : "";
+
   const scheduledAt   = competition?.date || event?.date || null;
   const eventStartAt  = event?.date || null;
-  const eventEndAt    = event?.endDate || null;   // present when ESPN exposes full tournament dates
+  const eventEndAt    = event?.endDate || null;
 
   return {
     id: competition?.id || `${event?.id || "ev"}-${compA.displayName}-${compB.displayName}`,
@@ -641,6 +678,10 @@ function normalizeCompetition(event, grouping, competition) {
     competitorB: compB,
     scoreLine: buildScoreLine(a, b),
     statusNorm,
+    isLiveLike,
+    isFinished,
+    liveStateLabel,
+    delayReason,
     status: competition?.status?.type?.shortDetail || competition?.status?.type?.description || "Scheduled",
     statusDetail: competition?.status?.type?.detail || competition?.status?.type?.description || "",
     round: competition?.round?.displayName || "",
@@ -654,8 +695,10 @@ function normalizeCompetition(event, grouping, competition) {
 }
 
 // ─── SORT HELPERS ─────────────────────────────────────────────────────────────
-// Canonical priority order: live first, then scheduled (chronological), then final/other
-const STATUS_PRIORITY = { live: 0, scheduled: 1, final: 2, retired: 3, walkover: 3, postponed: 4, suspended: 4, cancelled: 5, unknown: 6 };
+// Canonical priority order: live/suspended first, then scheduled (chronological), then final/other.
+// suspended = priority 0 (same as live) — it is an in-play match, just paused (rain delay etc.).
+// Previously suspended had priority 4 (same as postponed) which caused it to sort after finals.
+const STATUS_PRIORITY = { live: 0, suspended: 0, scheduled: 1, final: 2, retired: 3, walkover: 3, postponed: 4, cancelled: 5, unknown: 6 };
 
 function sortMatches(matches) {
   return matches.slice().sort((a, b) => {
@@ -975,6 +1018,35 @@ app.get("/api/atp", async (_req, res) => {
 });
 
 // ─── /api/debug — raw ESPN first competition for schema inspection ─────────────
+app.get("/api/debug/status", async (req, res) => {
+  // Returns raw ESPN status fields for every competition fetched today.
+  // Use this to diagnose unknown status values (e.g. new suspension types).
+  // Access: GET /api/debug/status?q=Sinner  (optional name filter)
+  try {
+    const [atpResult, wtaResult] = await Promise.allSettled([
+      fetchAllDates(ESPN_ATP_URL),
+      fetchAllDates(ESPN_WTA_URL),
+    ]);
+    const all = [
+      ...(atpResult.status === "fulfilled" ? atpResult.value : []),
+      ...(wtaResult.status === "fulfilled" ? wtaResult.value : []),
+    ];
+    const q = (req.query.q || "").toLowerCase();
+    const filtered = q
+      ? all.filter(m => (m.playerA + m.playerB).toLowerCase().includes(q))
+      : all;
+    return res.json(filtered.map(m => ({
+      players: `${m.playerA} vs ${m.playerB}`,
+      statusNorm: m.statusNorm,
+      statusDetail: m.statusDetail,
+      status: m.status,
+      scoreLine: m.scoreLine,
+    })));
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
 app.get("/api/debug", async (_req, res) => {
   try {
     const tour = (String(res.req?.query?.tour || "atp")).toLowerCase() === "wta" ? "WTA" : "ATP";
